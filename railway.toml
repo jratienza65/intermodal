@@ -1,0 +1,14 @@
+# Railway service configuration for intermodal.
+# https://docs.railway.com/reference/config-as-code
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# /healthz is the liveness endpoint; Railway waits for it before routing.
+healthcheckPath = "/healthz"
+healthcheckTimeout = 30
+# Restart only when the process exits non-zero, not on clean shutdown.
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

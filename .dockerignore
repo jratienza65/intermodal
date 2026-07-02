@@ -1,0 +1,31 @@
+# Version control
+.git
+.gitignore
+.github
+
+# Docs and examples (not needed to build the binary)
+*.md
+docs/
+examples/
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Local build artifacts
+/intermodal
+intermodal
+*.exe
+dist/
+bin/
+
+# Editor / OS cruft
+.idea/
+.vscode/
+.DS_Store
+
+# CI / deploy files not consumed by the build
+Dockerfile
+.dockerignore
+railway.toml

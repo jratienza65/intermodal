@@ -1,0 +1,54 @@
+# Prometheus scrape config for the "intermodal" Railway metrics exporter.
+#
+# intermodal exposes Prometheus metrics at GET /metrics. On Railway it binds
+# 0.0.0.0:$PORT and is reachable over the private network at
+# <service-name>.railway.internal:8080 (the internal port is the container's
+# listen port; PORT defaults to 8080 unless you override INTERMODAL_HTTP_ADDR).
+#
+# Drop this into the scrape_configs list of your prometheus.yml. Run this
+# Prometheus (or Grafana Agent / Alloy) as a *sibling service in the same
+# Railway project+environment* so that .railway.internal DNS resolves.
+
+scrape_configs:
+  - job_name: intermodal
+    metrics_path: /metrics
+    scheme: http
+    scrape_interval: 60s      # match INTERMODAL_POLL_INTERVAL (default 60s)
+    scrape_timeout: 30s
+    static_configs:
+      - targets:
+          - intermodal.railway.internal:8080
+        labels:
+          # Optional: identify the collector instance. The per-service labels
+          # (project_id, environment_id, service_id, region, ...) are attached
+          # by intermodal itself on each railway_service_* series.
+          collector: intermodal
+
+# ---------------------------------------------------------------------------
+# Grafana Agent / Grafana Alloy remote_write (Grafana Cloud) note
+# ---------------------------------------------------------------------------
+# If you don't run a Prometheus server and instead ship to Grafana Cloud, use
+# Alloy with a prometheus.scrape -> prometheus.remote_write pipeline. Alloy
+# River equivalent of the scrape above:
+#
+#   prometheus.scrape "intermodal" {
+#     targets = [
+#       { "__address__" = "intermodal.railway.internal:8080" },
+#     ]
+#     metrics_path    = "/metrics"
+#     scrape_interval = "60s"
+#     forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+#   }
+#
+#   prometheus.remote_write "grafana_cloud" {
+#     endpoint {
+#       url = "https://prometheus-prod-XX.grafana.net/api/prom/push"
+#       basic_auth {
+#         username = env("GRAFANA_CLOUD_PROM_USER")   # numeric instance ID
+#         password = env("GRAFANA_CLOUD_PROM_TOKEN")  # Grafana Cloud API token
+#       }
+#     }
+#   }
+#
+# Classic Grafana Agent (YAML) uses the same remote_write block under
+# metrics.configs[].remote_write with the identical URL + basic_auth.
