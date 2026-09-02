@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -309,4 +310,62 @@ func attrMap(attrs []Attr) map[string]string {
 		m[a.Key] = a.Value
 	}
 	return m
+}
+
+func TestConcurrencyDefaults(t *testing.T) {
+	c, err := Load(envMap(map[string]string{"RAILWAY_API_TOKEN": "a"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.PollConcurrency != DefaultConcurrency || c.BuildLogConcurrency != DefaultConcurrency {
+		t.Fatalf("defaults = poll %d / build %d, want %d for both",
+			c.PollConcurrency, c.BuildLogConcurrency, DefaultConcurrency)
+	}
+}
+
+// One master knob moves every fan-out; a per-subsystem knob overrides it.
+func TestConcurrencyMasterAndOverrides(t *testing.T) {
+	c, _ := Load(envMap(map[string]string{
+		"RAILWAY_API_TOKEN":      "a",
+		"INTERMODAL_CONCURRENCY": "12",
+	}))
+	if c.PollConcurrency != 12 || c.BuildLogConcurrency != 12 {
+		t.Errorf("master: poll %d / build %d, want 12 for both", c.PollConcurrency, c.BuildLogConcurrency)
+	}
+
+	c, _ = Load(envMap(map[string]string{
+		"RAILWAY_API_TOKEN":                "a",
+		"INTERMODAL_CONCURRENCY":           "12",
+		"INTERMODAL_POLL_CONCURRENCY":      "2",
+		"INTERMODAL_BUILD_LOG_CONCURRENCY": "30",
+	}))
+	if c.PollConcurrency != 2 {
+		t.Errorf("poll override = %d, want 2", c.PollConcurrency)
+	}
+	if c.BuildLogConcurrency != 30 {
+		t.Errorf("build override = %d, want 30", c.BuildLogConcurrency)
+	}
+}
+
+// A zero or negative value must never reach a semaphore: it would size the
+// channel at 0 and block the fan-out forever.
+func TestConcurrencyClamp(t *testing.T) {
+	for _, tc := range []struct{ set, wantPoll string }{
+		{"0", "1"}, {"-5", "1"}, {"9999", "256"}, {"not-a-number", "4"},
+	} {
+		c, err := Load(envMap(map[string]string{
+			"RAILWAY_API_TOKEN":      "a",
+			"INTERMODAL_CONCURRENCY": tc.set,
+		}))
+		if err != nil {
+			t.Fatalf("Load(%s): %v", tc.set, err)
+		}
+		want, _ := strconv.Atoi(tc.wantPoll)
+		if c.PollConcurrency != want || c.BuildLogConcurrency != want {
+			t.Errorf("%q: poll %d / build %d, want %d", tc.set, c.PollConcurrency, c.BuildLogConcurrency, want)
+		}
+		if c.PollConcurrency < 1 {
+			t.Errorf("%q: concurrency below 1 would deadlock the fan-out", tc.set)
+		}
+	}
 }

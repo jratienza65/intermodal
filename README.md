@@ -81,8 +81,22 @@ All configuration is environment variables. intermodal-specific knobs use the `I
 | `INTERMODAL_RAILWAY_RPS` | `5` | Client request rate limit (requests/sec). |
 | `INTERMODAL_RAILWAY_BURST` | `5` | Rate-limiter burst. |
 | `INTERMODAL_RAILWAY_MAX_RETRIES` | `4` | Max retries on transient/API errors. |
+| `INTERMODAL_CONCURRENCY` | `4` | Default fan-out width for every subsystem. See [Concurrency](#concurrency). |
 | `INTERMODAL_HTTP_ENDPOINTS` | Railway default | Comma-separated override for GraphQL HTTP endpoint(s). |
 | `INTERMODAL_WS_ENDPOINTS` | Railway default | Comma-separated override for GraphQL-WS endpoint(s). |
+
+#### Concurrency
+
+intermodal fans out over the targets that discovery returns. `INTERMODAL_CONCURRENCY` (default `4`) sets how wide, and each subsystem can override it:
+
+| Variable | Bounds |
+|---|---|
+| `INTERMODAL_POLL_CONCURRENCY` | Target environments polled at once. Each one is a Railway `metrics` call, so this is the burst width against the rate limit, and it caps the memory one poll cycle holds. |
+| `INTERMODAL_BUILD_LOG_CONCURRENCY` | Build-log streams fetched at once. The first reconcile finds one deployment per service, so a large fleet would otherwise open every stream together. |
+
+Values below `1` are raised to `1` (a fan-out of zero would stall), and values above `256` are lowered to `256`. Rate is a separate control: `INTERMODAL_RAILWAY_RPS` and `INTERMODAL_RAILWAY_BURST` throttle the request rate, while concurrency bounds the requests in flight. Raise concurrency for a large fleet that polls slowly; lower it to soften the burst against Railway.
+
+Deploy-log and HTTP-log subscriptions are **not** bounded this way. They are long-lived streams that hold their goroutine until the target goes away, so a limit would starve every target that did not get a slot. One subscription per environment (deploy) or per service deployment (HTTP) is the design; scope them with `INTERMODAL_SERVICES` / `INTERMODAL_HTTP_LOG_SERVICES` instead.
 
 ### Discovery / target selection
 
@@ -109,6 +123,7 @@ All configuration is environment variables. intermodal-specific knobs use the `I
 | `INTERMODAL_POLL_INTERVAL` | `60s` | How often Railway metrics are polled (also the OTLP push interval). |
 | `INTERMODAL_SAMPLE_RATE_SECONDS` | `60` | Railway metrics sample resolution. |
 | `INTERMODAL_METRICS_WINDOW` | `10m` | Look-back window per poll (`startDate = now − window`). |
+| `INTERMODAL_POLL_CONCURRENCY` | `INTERMODAL_CONCURRENCY` | Target environments polled at once. |
 
 ### Logs
 

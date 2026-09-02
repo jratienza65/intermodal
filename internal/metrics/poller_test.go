@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"sort"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -321,5 +322,90 @@ func TestSamplesFromResultsLatest(t *testing.T) {
 	mem := findSample(t, got, railway.MeasurementMemoryUsageGB, "svc-1")
 	if mem.Labels.ProjectID != "tag-proj" || mem.Labels.EnvironmentID != "tag-env" {
 		t.Errorf("expected tag IDs to win, got %+v", mem.Labels)
+	}
+}
+
+// blockingAPI records the highest number of Metrics calls in flight together.
+type blockingAPI struct {
+	release chan struct{}
+
+	mu       sync.Mutex
+	inFlight int
+	peak     int
+}
+
+func (b *blockingAPI) Metrics(context.Context, railway.MetricsQuery) ([]railway.MetricsResult, error) {
+	b.mu.Lock()
+	b.inFlight++
+	if b.inFlight > b.peak {
+		b.peak = b.inFlight
+	}
+	b.mu.Unlock()
+	<-b.release
+	b.mu.Lock()
+	b.inFlight--
+	b.mu.Unlock()
+	return nil, nil
+}
+
+func manyTargets(n int) []target.Target {
+	out := make([]target.Target, 0, n)
+	for i := range n {
+		id := "env-" + strconv.Itoa(i)
+		out = append(out, target.Target{ProjectID: "p", EnvironmentID: id})
+	}
+	return out
+}
+
+// The poll fan-out must never run more targets at once than PollConcurrency:
+// each one is a Railway API call, so this is the burst against the rate limit.
+func TestPollConcurrencyIsBounded(t *testing.T) {
+	for _, limit := range []int{1, 3, 8} {
+		t.Run(strconv.Itoa(limit), func(t *testing.T) {
+			api := &blockingAPI{release: make(chan struct{})}
+			cfg := testConfig()
+			cfg.PollConcurrency = limit
+			p := NewPoller(api, &fakeProvider{targets: manyTargets(24)}, NewStore(), cfg, discardLogger())
+
+			done := make(chan struct{})
+			go func() { p.poll(context.Background()); close(done) }()
+
+			// Let the fan-out saturate, then let every call finish.
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				api.mu.Lock()
+				got := api.inFlight
+				api.mu.Unlock()
+				if got >= limit || time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			close(api.release)
+			<-done
+
+			if api.peak > limit {
+				t.Errorf("peak in-flight = %d, want <= %d", api.peak, limit)
+			}
+			if api.peak < limit {
+				t.Errorf("peak in-flight = %d, want the full %d used", api.peak, limit)
+			}
+		})
+	}
+}
+
+// A hand-built Config (zero PollConcurrency) must still bound the fan-out. A
+// zero would size the semaphore channel at 0 and deadlock the poll.
+func TestPollConcurrencyZeroFallsBack(t *testing.T) {
+	p := NewPoller(&fakeAPI{}, &fakeProvider{targets: manyTargets(3)}, NewStore(), testConfig(), discardLogger())
+	if p.concurrency != config.DefaultConcurrency {
+		t.Fatalf("concurrency = %d, want %d", p.concurrency, config.DefaultConcurrency)
+	}
+	done := make(chan struct{})
+	go func() { p.poll(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("poll deadlocked with an unconfigured concurrency")
 	}
 }

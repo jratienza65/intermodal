@@ -47,6 +47,10 @@ type Config struct {
 	PollInterval      time.Duration
 	SampleRateSeconds int
 	MetricsWindow     time.Duration // startDate = now - MetricsWindow
+	// PollConcurrency bounds how many target environments are polled at once.
+	// One Railway API call goes out per target, so this is the burst width
+	// against the rate limiter, and it caps the memory a poll cycle holds.
+	PollConcurrency int
 	// Self-metrics (intermodal_*, railway_api_*) can be scraped and/or exported
 	// independently. SelfMetricsScrape exposes them on /metrics; SelfMetricsExport
 	// pushes them via OTLP (when the otlp metric exporter is enabled). Both
@@ -76,6 +80,10 @@ type Config struct {
 	// deployment). BuildLogServices scopes it independently. Empty = all services.
 	BuildLogs        bool
 	BuildLogServices []string
+	// BuildLogConcurrency bounds how many build-log streams are fetched at
+	// once. A first reconcile finds one deployment per service, so without a
+	// bound a large fleet opens every stream together.
+	BuildLogConcurrency int
 
 	// --- Loki sink ---
 	LokiURL         string
@@ -104,6 +112,16 @@ type Config struct {
 	MetricExportersSet bool
 	LogSinksSet        bool
 }
+
+// DefaultConcurrency is the fan-out width used when no concurrency is
+// configured. It is also the fallback a subsystem applies to a zero value, so
+// a hand-built Config still bounds its work.
+const DefaultConcurrency = 4
+
+// maxConcurrency is the ceiling on any configured fan-out. The Railway client's
+// own rate limiter (INTERMODAL_RAILWAY_RPS) is the real throttle; this only
+// stops a typo from opening thousands of goroutines.
+const maxConcurrency = 256
 
 // Attr is one OTLP resource attribute. It is a plain key/value pair so this
 // package stays free of OpenTelemetry imports.
@@ -243,6 +261,13 @@ func Load(getenv Getenv) (*Config, error) {
 	// the OTLP sink's queue, so an unbounded value would blow memory.
 	c.LogBatchSize = clamp(c.LogBatchSize, 1, 50000)
 	c.LogQueueSize = clamp(c.LogQueueSize, c.LogBatchSize, 1_000_000)
+
+	// Concurrency: a master default plus independent per-subsystem overrides.
+	// Every fan-out is bounded, so the work in flight stays predictable however
+	// many targets discovery returns.
+	concurrency := e.int("INTERMODAL_CONCURRENCY", DefaultConcurrency)
+	c.PollConcurrency = clamp(e.int("INTERMODAL_POLL_CONCURRENCY", concurrency), 1, maxConcurrency)
+	c.BuildLogConcurrency = clamp(e.int("INTERMODAL_BUILD_LOG_CONCURRENCY", concurrency), 1, maxConcurrency)
 
 	// Self-metrics: a master toggle plus independent scrape/export overrides.
 	selfMaster := e.bool("INTERMODAL_SELF_METRICS", true)

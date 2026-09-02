@@ -54,6 +54,11 @@ type Manager struct {
 	httpServices  map[string]struct{} // http-log-only service allowlist; empty = all domained
 	buildServices map[string]struct{} // build-log-only service allowlist; empty = all
 	reconcileTTL  time.Duration
+	// buildSem bounds concurrent build-log fetches. Deploy and HTTP logs are
+	// long-lived streams — one goroutine each is the design, and a semaphore
+	// there would starve the targets that never got a slot. Build-log fetches
+	// are finite, so they queue behind this instead.
+	buildSem chan struct{}
 
 	mu        sync.RWMutex
 	envSubs   map[string]context.CancelFunc // deploy logs, by environment id
@@ -79,6 +84,10 @@ func NewManager(src logSource, provider target.Provider, sinks []sink.Sink, cfg 
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
 	}
+	buildConcurrency := cfg.BuildLogConcurrency
+	if buildConcurrency < 1 {
+		buildConcurrency = config.DefaultConcurrency
+	}
 	return &Manager{
 		src:           src,
 		provider:      provider,
@@ -94,6 +103,7 @@ func NewManager(src logSource, provider target.Provider, sinks []sink.Sink, cfg 
 		httpServices:  httpServices,
 		buildServices: buildServices,
 		reconcileTTL:  ttl,
+		buildSem:      make(chan struct{}, buildConcurrency),
 		envSubs:       map[string]context.CancelFunc{},
 		httpSubs:      map[string]context.CancelFunc{},
 		buildSeen:     map[string]struct{}{},
@@ -434,7 +444,9 @@ func httpStatusLevel(status int) model.Level {
 const buildLogLimit = 1000
 
 // reconcileBuild fetches build logs once per newly-seen deployment. Build logs
-// are finite, so each deployment is fetched exactly once (deduped by ID).
+// are finite, so each deployment is fetched exactly once (deduped by ID). The
+// first reconcile finds one deployment per service, so the fetches run at most
+// BuildLogConcurrency at a time.
 func (m *Manager) reconcileBuild(ctx context.Context, targets []target.Target) {
 	for _, t := range targets {
 		for _, s := range t.Services {
@@ -456,6 +468,15 @@ func (m *Manager) reconcileBuild(ctx context.Context, targets []target.Target) {
 			m.subWG.Add(1)
 			go func(sc svcContext) {
 				defer m.subWG.Done()
+				// Acquire here, not in the loop above: reconcile also drives
+				// the deploy and HTTP subscription lifecycle, so it must not
+				// block waiting for a build-log slot.
+				select {
+				case m.buildSem <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				defer func() { <-m.buildSem }()
 				m.fetchBuildLogs(ctx, sc)
 			}(sc)
 		}

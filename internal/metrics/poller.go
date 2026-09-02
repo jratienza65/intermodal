@@ -17,8 +17,6 @@ type metricsAPI interface {
 	Metrics(ctx context.Context, q railway.MetricsQuery) ([]railway.MetricsResult, error)
 }
 
-const maxPollConcurrency = 4
-
 // Poller periodically queries Railway metrics for every target and publishes
 // the result to the Store. It decouples Railway polling from Prometheus scrapes
 // so scrape frequency can't blow the API rate limit.
@@ -30,6 +28,7 @@ type Poller struct {
 	interval     time.Duration
 	window       time.Duration
 	sampleRate   int
+	concurrency  int
 	measurements []railway.MetricMeasurement
 	groupBy      []railway.MetricTag
 }
@@ -39,6 +38,10 @@ func NewPoller(api metricsAPI, provider target.Provider, store *Store, cfg *conf
 	if log == nil {
 		log = slog.Default()
 	}
+	concurrency := cfg.PollConcurrency
+	if concurrency < 1 {
+		concurrency = config.DefaultConcurrency
+	}
 	return &Poller{
 		api:          api,
 		provider:     provider,
@@ -47,6 +50,7 @@ func NewPoller(api metricsAPI, provider target.Provider, store *Store, cfg *conf
 		interval:     cfg.PollInterval,
 		window:       cfg.MetricsWindow,
 		sampleRate:   cfg.SampleRateSeconds,
+		concurrency:  concurrency,
 		measurements: railway.DefaultMeasurements,
 		groupBy:      []railway.MetricTag{railway.TagServiceID, railway.TagDeploymentInstanceID},
 	}
@@ -104,7 +108,7 @@ func (p *Poller) poll(ctx context.Context) (*Snapshot, bool) {
 		samples []Sample
 		allOK   = true
 		wg      sync.WaitGroup
-		sem     = make(chan struct{}, maxPollConcurrency)
+		sem     = make(chan struct{}, p.concurrency)
 	)
 
 	for _, tg := range targets {

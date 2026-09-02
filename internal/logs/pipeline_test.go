@@ -2,6 +2,7 @@ package logs
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -501,5 +502,116 @@ func TestHTTPAttributes(t *testing.T) {
 	}
 	if _, ok := a["client.address"]; ok {
 		t.Error("empty optional client.address should be dropped")
+	}
+}
+
+// blockingBuildSource counts the build-log fetches running at the same time.
+type blockingBuildSource struct {
+	release chan struct{}
+
+	mu       sync.Mutex
+	inFlight int
+	peak     int
+	total    int
+}
+
+func (b *blockingBuildSource) StreamEnvironmentLogs(ctx context.Context, _ railway.LogStreamParams, _ func(railway.LogEntry) error) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (b *blockingBuildSource) StreamHTTPLogs(ctx context.Context, _ railway.HTTPLogStreamParams, _ func(railway.HTTPLogEntry) error) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (b *blockingBuildSource) StreamBuildLogs(_ context.Context, _ railway.BuildLogStreamParams, _ func(railway.LogEntry) error) error {
+	b.mu.Lock()
+	b.inFlight++
+	b.total++
+	if b.inFlight > b.peak {
+		b.peak = b.inFlight
+	}
+	b.mu.Unlock()
+	<-b.release
+	b.mu.Lock()
+	b.inFlight--
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *blockingBuildSource) stats() (peak, total int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.peak, b.total
+}
+
+// manyServiceTarget is one environment holding n services, each with its own
+// deployment — what a first reconcile over a large project looks like.
+func manyServiceTarget(n int) target.Target {
+	t := oneTarget()
+	t.Services = nil
+	for i := range n {
+		id := "svc-" + strconv.Itoa(i)
+		t.Services = append(t.Services, target.Service{ID: id, Name: id, DeploymentID: "dep-" + strconv.Itoa(i)})
+	}
+	return t
+}
+
+// The first reconcile finds one deployment per service at once. Those fetches
+// must queue behind BuildLogConcurrency instead of all opening together.
+func TestBuildLogConcurrencyIsBounded(t *testing.T) {
+	const services = 20
+	const limit = 3
+
+	src := &blockingBuildSource{release: make(chan struct{})}
+	cfg := baseConfig()
+	cfg.BuildLogs = true
+	cfg.DeployLogs = false
+	cfg.BuildLogConcurrency = limit
+
+	m := NewManager(src, &fakeProvider{targets: []target.Target{manyServiceTarget(services)}}, []sink.Sink{&fakeSink{name: "s"}}, cfg, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.reconcile(ctx)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		src.mu.Lock()
+		got := src.inFlight
+		src.mu.Unlock()
+		if got >= limit || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if peak, _ := src.stats(); peak > limit {
+		t.Fatalf("peak concurrent build fetches = %d, want <= %d", peak, limit)
+	}
+
+	close(src.release)
+	m.subWG.Wait()
+
+	peak, total := src.stats()
+	if peak > limit {
+		t.Errorf("peak concurrent build fetches = %d, want <= %d", peak, limit)
+	}
+	if peak < limit {
+		t.Errorf("peak concurrent build fetches = %d, want the full %d used", peak, limit)
+	}
+	// Bounding must not drop work: every deployment is still fetched once.
+	if total != services {
+		t.Errorf("fetched %d deployments, want %d", total, services)
+	}
+}
+
+// A hand-built Config (zero BuildLogConcurrency) must not size the semaphore at
+// zero, which would block every build-log fetch forever.
+func TestBuildLogConcurrencyZeroFallsBack(t *testing.T) {
+	cfg := baseConfig()
+	cfg.BuildLogs = true
+	m := NewManager(newFakeSource(), &fakeProvider{}, []sink.Sink{&fakeSink{name: "s"}}, cfg, nil)
+	if got := cap(m.buildSem); got != config.DefaultConcurrency {
+		t.Fatalf("build semaphore capacity = %d, want %d", got, config.DefaultConcurrency)
 	}
 }

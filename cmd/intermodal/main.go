@@ -162,6 +162,7 @@ func serve(cfg *config.Config, client *railway.Client, logger *slog.Logger) erro
 		"token_type", cfg.TokenType.String(),
 		"metrics_enabled", cfg.MetricsEnabled,
 		"metric_exporters", cfg.MetricExporters,
+		"poll_concurrency", cfg.PollConcurrency,
 		"logs_enabled", cfg.LogsEnabled,
 		"log_sinks", cfg.LogSinks,
 		"addr", cfg.HTTPAddr,
