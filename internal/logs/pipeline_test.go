@@ -615,3 +615,25 @@ func TestBuildLogConcurrencyZeroFallsBack(t *testing.T) {
 		t.Fatalf("build semaphore capacity = %d, want %d", got, config.DefaultConcurrency)
 	}
 }
+
+func TestAttributesMapUnquotesJSON(t *testing.T) {
+	got := attributesMap([]railway.LogAttribute{
+		{Key: "level", Value: `"warn"`},         // JSON string: quotes stripped
+		{Key: "err", Value: `"boom: it broke"`}, // spaces/colon survive
+		{Key: "count", Value: "5"},              // bare number: unchanged
+		{Key: "plain", Value: "already"},        // bare string: unchanged
+		{Key: "escaped", Value: `"a\"b"`},       // embedded quote decodes to a"b
+	})
+	want := map[string]string{
+		"level":   "warn",
+		"err":     "boom: it broke",
+		"count":   "5",
+		"plain":   "already",
+		"escaped": `a"b`,
+	}
+	for k, w := range want {
+		if got[k] != w {
+			t.Errorf("attr %q = %q, want %q", k, got[k], w)
+		}
+	}
+}

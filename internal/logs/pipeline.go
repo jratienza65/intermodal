@@ -6,6 +6,7 @@ package logs
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -519,15 +520,36 @@ func (m *Manager) convertBuild(e railway.LogEntry, sc svcContext) model.LogRecor
 }
 
 // attributesMap converts Railway log attributes to a plain map (nil if empty).
+// Railway hands back each attribute value as its raw JSON token, so string
+// values arrive quoted (e.g. `"warn"`); unquoteJSON decodes them to the bare
+// value.
 func attributesMap(attrs []railway.LogAttribute) map[string]string {
 	if len(attrs) == 0 {
 		return nil
 	}
 	m := make(map[string]string, len(attrs))
 	for _, a := range attrs {
-		m[a.Key] = a.Value
+		m[a.Key] = unquoteJSON(a.Value)
 	}
 	return m
+}
+
+// unquoteJSON decodes a Railway structured-log attribute value. Railway returns
+// each value as its raw JSON token, so a JSON string arrives with its quotes
+// (e.g. `"warn"`, `"boom: it broke"`). Decode those to the bare string so
+// downstream labels and Loki's level detection see `warn`, not `"warn"`.
+// Non-string tokens (numbers, objects, arrays) and already-bare values start
+// with something other than `"` and are returned unchanged; a quoted-looking
+// value that fails to decode is also left as-is.
+func unquoteJSON(v string) string {
+	if len(v) < 2 || v[0] != '"' {
+		return v
+	}
+	var s string
+	if json.Unmarshal([]byte(v), &s) == nil {
+		return s
+	}
+	return v
 }
 
 // toLowerSet builds a case-insensitive membership set from allowlist entries
