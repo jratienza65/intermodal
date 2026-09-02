@@ -27,6 +27,7 @@ func doctor(ctx context.Context, cfg *config.Config, client *railway.Client, log
 	fmt.Printf("token type:      %s\n", cfg.TokenType.String())
 	fmt.Printf("http endpoint:   %s\n", firstOr(cfg.HTTPEndpoints, railway.DefaultHTTPEndpoints[0]))
 	fmt.Printf("ws endpoint:     %s\n", firstOr(cfg.WSEndpoints, railway.DefaultWSEndpoints[0]))
+	fmt.Printf("instance id:     %s\n", nameOr(cfg.Identity.InstanceID, "(none — self-metrics from several instances will collide; set INTERMODAL_INSTANCE_ID)"))
 	fmt.Println()
 
 	// 1. Identity (account tokens only).

@@ -185,3 +185,128 @@ func TestDefaults(t *testing.T) {
 		t.Error("stdout sink should be default")
 	}
 }
+
+// Railway injects the identity variables into every service, so an intermodal
+// on Railway identifies itself with no configuration at all.
+func TestIdentityFromRailwayEnv(t *testing.T) {
+	c, err := Load(envMap(map[string]string{
+		"RAILWAY_API_TOKEN":        "a",
+		"RAILWAY_PROJECT_ID":       "p-1",
+		"RAILWAY_PROJECT_NAME":     "PSMND.DEV",
+		"RAILWAY_ENVIRONMENT_ID":   "e-1",
+		"RAILWAY_ENVIRONMENT_NAME": "prod",
+		"RAILWAY_SERVICE_ID":       "s-1",
+		"RAILWAY_SERVICE_NAME":     "intermodal",
+	}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := Identity{
+		InstanceID:      "s-1",
+		ProjectID:       "p-1",
+		ProjectName:     "PSMND.DEV",
+		EnvironmentID:   "e-1",
+		EnvironmentName: "prod",
+		ServiceID:       "s-1",
+		ServiceName:     "intermodal",
+	}
+	if c.Identity != want {
+		t.Fatalf("identity = %+v, want %+v", c.Identity, want)
+	}
+}
+
+func TestInstanceIDPrecedence(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"explicit wins", map[string]string{
+			"INTERMODAL_INSTANCE_ID": "replica-7",
+			"RAILWAY_SERVICE_ID":     "s-1",
+			"HOSTNAME":               "box",
+		}, "replica-7"},
+		{"railway service id second", map[string]string{
+			"RAILWAY_SERVICE_ID": "s-1",
+			"HOSTNAME":           "box",
+		}, "s-1"},
+		{"hostname last", map[string]string{"HOSTNAME": "box"}, "box"},
+		{"empty off railway", map[string]string{}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := map[string]string{"RAILWAY_API_TOKEN": "a"}
+			for k, v := range tc.env {
+				env[k] = v
+			}
+			c, err := Load(envMap(env))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if c.Identity.InstanceID != tc.want {
+				t.Errorf("instance id = %q, want %q", c.Identity.InstanceID, tc.want)
+			}
+		})
+	}
+}
+
+// The self-metric resource must carry service.instance.id, because that is
+// what the OTLP-to-Prometheus translation turns into the `instance` label. Two
+// intermodal instances without it write one shared series.
+func TestSelfResourceAttributes(t *testing.T) {
+	c, err := Load(envMap(map[string]string{
+		"RAILWAY_API_TOKEN":    "a",
+		"RAILWAY_SERVICE_ID":   "s-1",
+		"RAILWAY_PROJECT_NAME": "PSMND.DEV",
+	}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := attrMap(c.SelfResourceAttributes())
+	for k, want := range map[string]string{
+		"service.name":         "intermodal",
+		"service.instance.id":  "s-1",
+		"railway.service.id":   "s-1",
+		"railway.project.name": "PSMND.DEV",
+	} {
+		if got[k] != want {
+			t.Errorf("%s = %q, want %q", k, got[k], want)
+		}
+	}
+	// Unset Railway variables must not appear as empty attributes.
+	if _, ok := got["railway.environment.id"]; ok {
+		t.Errorf("empty identity field exported: %#v", got)
+	}
+}
+
+func TestResourceAttrsOverride(t *testing.T) {
+	for _, key := range []string{"INTERMODAL_RESOURCE_ATTRIBUTES", "OTEL_RESOURCE_ATTRIBUTES"} {
+		c, err := Load(envMap(map[string]string{
+			"RAILWAY_API_TOKEN":  "a",
+			"RAILWAY_SERVICE_ID": "s-1",
+			key:                  "service.instance.id=custom,deployment.tier=edge",
+		}))
+		if err != nil {
+			t.Fatalf("Load(%s): %v", key, err)
+		}
+		attrs := c.SelfResourceAttributes()
+		got := attrMap(attrs)
+		if got["service.instance.id"] != "custom" {
+			t.Errorf("%s: instance id = %q, want custom", key, got["service.instance.id"])
+		}
+		if got["deployment.tier"] != "edge" {
+			t.Errorf("%s: extra attribute = %q, want edge", key, got["deployment.tier"])
+		}
+		if len(got) != len(attrs) {
+			t.Errorf("%s: duplicate keys in %+v", key, attrs)
+		}
+	}
+}
+
+func attrMap(attrs []Attr) map[string]string {
+	m := make(map[string]string, len(attrs))
+	for _, a := range attrs {
+		m[a.Key] = a.Value
+	}
+	return m
+}

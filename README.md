@@ -144,6 +144,10 @@ All configuration is environment variables. intermodal-specific knobs use the `I
 |---|---|---|
 | `INTERMODAL_LOG_LEVEL` | `info` | intermodal's own log level (`debug`, `info`, `warn`, `error`). |
 | `INTERMODAL_SERVICE_NAME` | `intermodal` | Resource/service-name attribute and self-identification. |
+| `INTERMODAL_INSTANCE_ID` | `RAILWAY_SERVICE_ID`, else `HOSTNAME` | `service.instance.id` on the self-metrics resource. See [Instance identity](#instance-identity). |
+| `INTERMODAL_RESOURCE_ATTRIBUTES` | — | Extra OTLP resource attributes on the self-metrics, `k=v,k=v`. Overrides the defaults above. `OTEL_RESOURCE_ATTRIBUTES` is also honored. |
+
+Railway injects `RAILWAY_PROJECT_ID`, `RAILWAY_PROJECT_NAME`, `RAILWAY_ENVIRONMENT_ID`, `RAILWAY_ENVIRONMENT_NAME`, `RAILWAY_SERVICE_ID`, and `RAILWAY_SERVICE_NAME` into every service. intermodal reads them to identify itself, so on Railway there is nothing to configure.
 
 > Validation: if both metrics and logs are disabled, startup fails. If `loki` is enabled without `INTERMODAL_LOKI_URL`, or any otlp path is enabled without an OTLP endpoint, startup fails.
 
@@ -188,6 +192,22 @@ All of the above carry the labels: `project_id`, `project_name`, `environment_id
 | `intermodal_log_subscription_reconnects_total` | counter | Log subscription reconnect attempts. |
 
 Standard Go runtime and process collectors are also registered.
+
+#### Instance identity
+
+These metrics describe **intermodal itself**, not a Railway service, so their labels hold nothing that tells one instance from another. When you run several intermodal instances — one per project, say — they must be told apart, or they all write to the same series in your backend: gauges flap between each instance's value and counters go backwards.
+
+The `instance` label carries that identity:
+
+- **Pull path.** Prometheus adds `instance` from the scrape target. Nothing to do.
+- **Push path (OTLP).** intermodal sets `service.instance.id` on the self-metrics resource, which the OTLP-to-Prometheus translation turns into `instance`. It defaults to `RAILWAY_SERVICE_ID` — unique per instance and stable across redeploys, so counters keep one series. The resource also carries `railway.project.id`, `railway.project.name`, `railway.environment.id`, `railway.environment.name`, `railway.service.id`, and `railway.service.name`, for grouping by a readable name where your collector converts resource attributes into labels.
+
+Run `intermodal doctor` to see the resolved instance id. To confirm the fleet is distinct, `count(intermodal_build_info)` must equal the number of instances you run.
+
+Two cases need `INTERMODAL_INSTANCE_ID`:
+
+- **More than one replica of one Railway service.** All replicas share `RAILWAY_SERVICE_ID`. Set `INTERMODAL_INSTANCE_ID=${{RAILWAY_REPLICA_ID}}`. Railway makes a new replica id on each deploy, so expect a new series per deploy.
+- **Off Railway,** where `RAILWAY_SERVICE_ID` is unset and the fallback is `HOSTNAME`. Set the variable if hostnames are not unique.
 
 ## Logs: record shape and sinks
 

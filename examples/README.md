@@ -15,7 +15,10 @@ your metrics backend.
 - **`grafana-dashboard-intermodal.json` — intermodal self / headroom.**
   intermodal's own health: Railway API request rate vs plan budget, metrics
   poll duration, log throughput, drops, sink errors, and subscription
-  reconnects. Reads the `intermodal_*` / `railway_api_*` series.
+  reconnects. Reads the `intermodal_*` / `railway_api_*` series. An
+  **Instance** template variable scopes every panel, so one board covers a
+  fleet of intermodal instances; the top row counts the instances reporting
+  and a **Per instance** row breaks the fleet down.
 
 ## Requirements
 
@@ -67,6 +70,21 @@ measurements are exported; ratios like utilization are derived in-query
 
 > Metric names assume the standard OTLP→Prometheus translation. If your
 > collector appends unit suffixes, adjust the dashboard queries to match.
+
+## Telling intermodal instances apart
+
+The self-metrics describe intermodal itself, so their labels hold nothing that
+separates one instance from another. The **intermodal self / headroom** board
+groups them by the `instance` label instead:
+
+- **Scrape path** — Prometheus sets `instance` from the target. Nothing to do.
+- **OTLP push path** — intermodal sets `service.instance.id` on the
+  self-metrics resource (from `RAILWAY_SERVICE_ID` by default), which the
+  OTLP→Prometheus translation turns into `instance`.
+
+`count(intermodal_build_info)` must equal the number of intermodal instances
+you run. A lower count means two instances share one identity and are
+overwriting each other's series — see [Instance identity](../README.md#instance-identity).
 
 See the [project README](../README.md) for how to deploy intermodal and produce
 these metrics.

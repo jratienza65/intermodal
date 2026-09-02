@@ -7,6 +7,7 @@ package config
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -90,10 +91,98 @@ type Config struct {
 	LogLevel    string
 	ServiceName string // resource attribute + self-identification
 
+	// Identity tells one intermodal instance apart from every other instance
+	// that pushes into the same backend. It is resolved from Railway's
+	// injected service variables, so it needs no configuration on Railway.
+	Identity Identity
+	// ResourceAttrs are extra OTLP resource attributes for intermodal's own
+	// telemetry. They merge after Identity, so they can override any key.
+	ResourceAttrs map[string]string
+
 	// Explicit-presence flags (whether the env var was set), used to warn on
 	// contradictory config such as "metrics disabled but exporters configured".
 	MetricExportersSet bool
 	LogSinksSet        bool
+}
+
+// Attr is one OTLP resource attribute. It is a plain key/value pair so this
+// package stays free of OpenTelemetry imports.
+type Attr struct{ Key, Value string }
+
+// Identity is where this intermodal instance runs.
+//
+// intermodal's own metrics (intermodal_*, railway_api_*) describe the instance,
+// not a Railway service, so nothing in the metric labels separates one instance
+// from another. Two instances that push over OTLP to one backend therefore
+// write the same series and overwrite each other: gauges flap between values
+// and counters go backwards. Identity gives each instance a distinct OTLP
+// resource, which the OTLP-to-Prometheus translation turns into an `instance`
+// label — the same label a Prometheus scrape adds on the pull path.
+type Identity struct {
+	// InstanceID becomes service.instance.id. It must differ per instance.
+	InstanceID string
+	// The Railway coordinates of the instance, for readable grouping.
+	ProjectID       string
+	ProjectName     string
+	EnvironmentID   string
+	EnvironmentName string
+	ServiceID       string
+	ServiceName     string
+}
+
+// Attributes returns the identity as OTLP resource attributes, in a stable
+// order. Empty fields are left out.
+func (i Identity) Attributes() []Attr {
+	out := make([]Attr, 0, 7)
+	add := func(k, v string) {
+		if v != "" {
+			out = append(out, Attr{Key: k, Value: v})
+		}
+	}
+	add("service.instance.id", i.InstanceID)
+	add("railway.project.id", i.ProjectID)
+	add("railway.project.name", i.ProjectName)
+	add("railway.environment.id", i.EnvironmentID)
+	add("railway.environment.name", i.EnvironmentName)
+	add("railway.service.id", i.ServiceID)
+	add("railway.service.name", i.ServiceName)
+	return out
+}
+
+// SelfResourceAttributes returns the OTLP resource attributes for intermodal's
+// own telemetry: the service name, the per-instance identity, and finally the
+// INTERMODAL_RESOURCE_ATTRIBUTES entries, which override the keys before them.
+func (c *Config) SelfResourceAttributes() []Attr {
+	attrs := make([]Attr, 0, 8+len(c.ResourceAttrs))
+	attrs = append(attrs, Attr{Key: "service.name", Value: c.ServiceName})
+	attrs = append(attrs, c.Identity.Attributes()...)
+
+	keys := make([]string, 0, len(c.ResourceAttrs))
+	for k := range c.ResourceAttrs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := c.ResourceAttrs[k]
+		if v == "" {
+			continue
+		}
+		if i := indexAttr(attrs, k); i >= 0 {
+			attrs[i].Value = v
+			continue
+		}
+		attrs = append(attrs, Attr{Key: k, Value: v})
+	}
+	return attrs
+}
+
+func indexAttr(attrs []Attr, key string) int {
+	for i, a := range attrs {
+		if a.Key == key {
+			return i
+		}
+	}
+	return -1
 }
 
 // MetricsExporterEnabled reports whether the named metric exporter is on.
@@ -144,6 +233,7 @@ func Load(getenv Getenv) (*Config, error) {
 		LogLevel:          e.str("INTERMODAL_LOG_LEVEL", "info"),
 		ServiceName:       e.str("INTERMODAL_SERVICE_NAME", "intermodal"),
 		MetricsAuthToken:  e.str("INTERMODAL_METRICS_AUTH_TOKEN", ""),
+		ResourceAttrs:     e.kvMapAny([]string{"INTERMODAL_RESOURCE_ATTRIBUTES", "OTEL_RESOURCE_ATTRIBUTES"}),
 
 		MetricExportersSet: strings.TrimSpace(getenv("INTERMODAL_METRICS_EXPORTERS")) != "",
 		LogSinksSet:        strings.TrimSpace(getenv("INTERMODAL_SINKS")) != "",
@@ -175,6 +265,8 @@ func Load(getenv Getenv) (*Config, error) {
 		c.WSEndpoints = eps
 	}
 
+	c.Identity = resolveIdentity(e)
+
 	if err := c.resolveToken(e); err != nil {
 		return nil, err
 	}
@@ -182,6 +274,30 @@ func Load(getenv Getenv) (*Config, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// resolveIdentity reads the identity of this instance from Railway's injected
+// service variables.
+//
+// service.instance.id must be unique per instance and stable across restarts,
+// so that a counter keeps one series over a redeploy. RAILWAY_SERVICE_ID is
+// both. RAILWAY_REPLICA_ID changes on every deploy, so it is not the default;
+// set INTERMODAL_INSTANCE_ID to it when you run more than one replica. Off
+// Railway, HOSTNAME is the last fallback.
+func resolveIdentity(e env) Identity {
+	return Identity{
+		InstanceID: e.strAny([]string{
+			"INTERMODAL_INSTANCE_ID",
+			"RAILWAY_SERVICE_ID",
+			"HOSTNAME",
+		}, ""),
+		ProjectID:       e.str("RAILWAY_PROJECT_ID", ""),
+		ProjectName:     e.str("RAILWAY_PROJECT_NAME", ""),
+		EnvironmentID:   e.str("RAILWAY_ENVIRONMENT_ID", ""),
+		EnvironmentName: e.strAny([]string{"RAILWAY_ENVIRONMENT_NAME", "RAILWAY_ENVIRONMENT"}, ""),
+		ServiceID:       e.str("RAILWAY_SERVICE_ID", ""),
+		ServiceName:     e.str("RAILWAY_SERVICE_NAME", ""),
+	}
 }
 
 // resolveToken determines the token and its type from the environment.
@@ -313,7 +429,21 @@ func (e env) listDefault(key string, def []string) []string {
 
 // kvMap parses "k1=v1,k2=v2" into a map.
 func (e env) kvMap(key string) map[string]string {
-	raw := splitList(e.get(key))
+	return parseKV(e.get(key))
+}
+
+// kvMapAny parses the first key that holds a "k1=v1,k2=v2" value.
+func (e env) kvMapAny(keys []string) map[string]string {
+	for _, k := range keys {
+		if m := parseKV(e.get(k)); len(m) > 0 {
+			return m
+		}
+	}
+	return nil
+}
+
+func parseKV(s string) map[string]string {
+	raw := splitList(s)
 	if len(raw) == 0 {
 		return nil
 	}
