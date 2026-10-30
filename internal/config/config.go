@@ -84,6 +84,25 @@ type Config struct {
 	// once. A first reconcile finds one deployment per service, so without a
 	// bound a large fleet opens every stream together.
 	BuildLogConcurrency int
+	// LogSource picks how deploy and HTTP logs are read: "poll" (default) pages
+	// Railway's log history queries from a cursor; "subscribe" uses the live
+	// GraphQL subscriptions, which deliver only part of the lines.
+	LogSource string
+	// LogCursorFile is where poll cursors persist across restarts (e.g. on a
+	// Railway volume). Empty keeps them in memory only.
+	LogCursorFile string
+	// LogPollInterval is the poll period while a source returns lines; idle
+	// sources back off up to LogPollMaxInterval.
+	LogPollInterval    time.Duration
+	LogPollMaxInterval time.Duration
+	// LogSettle holds back the newest lines, so late lines reach Railway before
+	// a poll window closes over them.
+	LogSettle time.Duration
+	// LogMaxCatchUp caps how far back a poller resumes from a stored cursor.
+	LogMaxCatchUp time.Duration
+	// LogInitialLookback is where a poller with no stored cursor starts, back
+	// from process start.
+	LogInitialLookback time.Duration
 
 	// --- Loki sink ---
 	LokiURL         string
@@ -117,6 +136,12 @@ type Config struct {
 // configured. It is also the fallback a subsystem applies to a zero value, so
 // a hand-built Config still bounds its work.
 const DefaultConcurrency = 4
+
+// Log sources for deploy and HTTP logs (INTERMODAL_LOG_SOURCE).
+const (
+	LogSourcePoll      = "poll"
+	LogSourceSubscribe = "subscribe"
+)
 
 // maxConcurrency is the ceiling on any configured fan-out. The Railway client's
 // own rate limiter (INTERMODAL_RAILWAY_RPS) is the real throttle; this only
@@ -216,42 +241,49 @@ type Getenv func(string) string
 func Load(getenv Getenv) (*Config, error) {
 	e := env{getenv}
 	c := &Config{
-		RPS:               e.float("INTERMODAL_RAILWAY_RPS", 5),
-		Burst:             e.int("INTERMODAL_RAILWAY_BURST", 5),
-		MaxRetries:        e.int("INTERMODAL_RAILWAY_MAX_RETRIES", 4),
-		WorkspaceID:       e.str("INTERMODAL_WORKSPACE_ID", ""),
-		DiscoveryTTL:      e.dur("INTERMODAL_DISCOVERY_TTL", 5*time.Minute),
-		Projects:          e.list("INTERMODAL_PROJECTS"),
-		Environments:      e.list("INTERMODAL_ENVIRONMENTS"),
-		Services:          e.list("INTERMODAL_SERVICES"),
-		MetricsEnabled:    e.bool("INTERMODAL_METRICS_ENABLED", true),
-		MetricExporters:   e.listDefault("INTERMODAL_METRICS_EXPORTERS", []string{"prometheus"}),
-		PollInterval:      e.dur("INTERMODAL_POLL_INTERVAL", 60*time.Second),
-		SampleRateSeconds: e.int("INTERMODAL_SAMPLE_RATE_SECONDS", 60),
-		MetricsWindow:     e.dur("INTERMODAL_METRICS_WINDOW", 10*time.Minute),
-		LogsEnabled:       e.bool("INTERMODAL_LOGS_ENABLED", true),
-		LogSinks:          e.listDefault("INTERMODAL_SINKS", []string{"stdout"}),
-		LogFilter:         e.str("INTERMODAL_LOG_FILTER", ""),
-		LogBackfill:       e.int("INTERMODAL_LOG_BACKFILL", 0),
-		LogQueueSize:      e.int("INTERMODAL_LOG_QUEUE_SIZE", 10000),
-		LogBatchSize:      e.int("INTERMODAL_LOG_BATCH_SIZE", 500),
-		LogBatchTimeout:   e.dur("INTERMODAL_LOG_BATCH_TIMEOUT", 2*time.Second),
-		DeployLogs:        e.bool("INTERMODAL_DEPLOY_LOGS", true),
-		HTTPLogs:          e.bool("INTERMODAL_HTTP_LOGS", false),
-		HTTPLogFilter:     e.str("INTERMODAL_HTTP_LOG_FILTER", ""),
-		HTTPLogServices:   e.list("INTERMODAL_HTTP_LOG_SERVICES"),
-		BuildLogs:         e.bool("INTERMODAL_BUILD_LOGS", false),
-		BuildLogServices:  e.list("INTERMODAL_BUILD_LOG_SERVICES"),
-		LokiURL:           e.str("INTERMODAL_LOKI_URL", ""),
-		LokiTenantID:      e.str("INTERMODAL_LOKI_TENANT_ID", ""),
-		LokiExtraLabels:   e.kvMap("INTERMODAL_LOKI_LABELS"),
-		OTLPEndpoint:      e.strAny([]string{"INTERMODAL_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT"}, ""),
-		OTLPInsecure:      e.bool("INTERMODAL_OTLP_INSECURE", false),
-		OTLPHeaders:       e.kvMap("INTERMODAL_OTLP_HEADERS"),
-		LogLevel:          e.str("INTERMODAL_LOG_LEVEL", "info"),
-		ServiceName:       e.str("INTERMODAL_SERVICE_NAME", "intermodal"),
-		MetricsAuthToken:  e.str("INTERMODAL_METRICS_AUTH_TOKEN", ""),
-		ResourceAttrs:     e.kvMapAny([]string{"INTERMODAL_RESOURCE_ATTRIBUTES", "OTEL_RESOURCE_ATTRIBUTES"}),
+		RPS:                e.float("INTERMODAL_RAILWAY_RPS", 5),
+		Burst:              e.int("INTERMODAL_RAILWAY_BURST", 5),
+		MaxRetries:         e.int("INTERMODAL_RAILWAY_MAX_RETRIES", 4),
+		WorkspaceID:        e.str("INTERMODAL_WORKSPACE_ID", ""),
+		DiscoveryTTL:       e.dur("INTERMODAL_DISCOVERY_TTL", 5*time.Minute),
+		Projects:           e.list("INTERMODAL_PROJECTS"),
+		Environments:       e.list("INTERMODAL_ENVIRONMENTS"),
+		Services:           e.list("INTERMODAL_SERVICES"),
+		MetricsEnabled:     e.bool("INTERMODAL_METRICS_ENABLED", true),
+		MetricExporters:    e.listDefault("INTERMODAL_METRICS_EXPORTERS", []string{"prometheus"}),
+		PollInterval:       e.dur("INTERMODAL_POLL_INTERVAL", 60*time.Second),
+		SampleRateSeconds:  e.int("INTERMODAL_SAMPLE_RATE_SECONDS", 60),
+		MetricsWindow:      e.dur("INTERMODAL_METRICS_WINDOW", 10*time.Minute),
+		LogsEnabled:        e.bool("INTERMODAL_LOGS_ENABLED", true),
+		LogSinks:           e.listDefault("INTERMODAL_SINKS", []string{"stdout"}),
+		LogFilter:          e.str("INTERMODAL_LOG_FILTER", ""),
+		LogBackfill:        e.int("INTERMODAL_LOG_BACKFILL", 0),
+		LogQueueSize:       e.int("INTERMODAL_LOG_QUEUE_SIZE", 10000),
+		LogBatchSize:       e.int("INTERMODAL_LOG_BATCH_SIZE", 500),
+		LogBatchTimeout:    e.dur("INTERMODAL_LOG_BATCH_TIMEOUT", 2*time.Second),
+		DeployLogs:         e.bool("INTERMODAL_DEPLOY_LOGS", true),
+		HTTPLogs:           e.bool("INTERMODAL_HTTP_LOGS", false),
+		HTTPLogFilter:      e.str("INTERMODAL_HTTP_LOG_FILTER", ""),
+		HTTPLogServices:    e.list("INTERMODAL_HTTP_LOG_SERVICES"),
+		BuildLogs:          e.bool("INTERMODAL_BUILD_LOGS", false),
+		BuildLogServices:   e.list("INTERMODAL_BUILD_LOG_SERVICES"),
+		LogSource:          strings.ToLower(e.str("INTERMODAL_LOG_SOURCE", LogSourcePoll)),
+		LogCursorFile:      e.str("INTERMODAL_LOG_CURSOR_FILE", ""),
+		LogPollInterval:    e.dur("INTERMODAL_LOG_POLL_INTERVAL", 10*time.Second),
+		LogPollMaxInterval: e.dur("INTERMODAL_LOG_POLL_MAX_INTERVAL", 60*time.Second),
+		LogSettle:          e.dur("INTERMODAL_LOG_SETTLE", 20*time.Second),
+		LogMaxCatchUp:      e.dur("INTERMODAL_LOG_MAX_CATCHUP", 6*time.Hour),
+		LogInitialLookback: e.dur("INTERMODAL_LOG_INITIAL_LOOKBACK", 5*time.Minute),
+		LokiURL:            e.str("INTERMODAL_LOKI_URL", ""),
+		LokiTenantID:       e.str("INTERMODAL_LOKI_TENANT_ID", ""),
+		LokiExtraLabels:    e.kvMap("INTERMODAL_LOKI_LABELS"),
+		OTLPEndpoint:       e.strAny([]string{"INTERMODAL_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT"}, ""),
+		OTLPInsecure:       e.bool("INTERMODAL_OTLP_INSECURE", false),
+		OTLPHeaders:        e.kvMap("INTERMODAL_OTLP_HEADERS"),
+		LogLevel:           e.str("INTERMODAL_LOG_LEVEL", "info"),
+		ServiceName:        e.str("INTERMODAL_SERVICE_NAME", "intermodal"),
+		MetricsAuthToken:   e.str("INTERMODAL_METRICS_AUTH_TOKEN", ""),
+		ResourceAttrs:      e.kvMapAny([]string{"INTERMODAL_RESOURCE_ATTRIBUTES", "OTEL_RESOURCE_ATTRIBUTES"}),
 
 		MetricExportersSet: strings.TrimSpace(getenv("INTERMODAL_METRICS_EXPORTERS")) != "",
 		LogSinksSet:        strings.TrimSpace(getenv("INTERMODAL_SINKS")) != "",
@@ -368,6 +400,17 @@ func (c *Config) validate() error {
 	}
 	if c.PollInterval <= 0 {
 		return fmt.Errorf("config: INTERMODAL_POLL_INTERVAL must be positive")
+	}
+	if c.LogSource != LogSourcePoll && c.LogSource != LogSourceSubscribe {
+		return fmt.Errorf("config: INTERMODAL_LOG_SOURCE must be %q or %q, got %q", LogSourcePoll, LogSourceSubscribe, c.LogSource)
+	}
+	if c.LogSource == LogSourcePoll {
+		if c.LogPollInterval <= 0 || c.LogPollMaxInterval < c.LogPollInterval {
+			return fmt.Errorf("config: need 0 < INTERMODAL_LOG_POLL_INTERVAL <= INTERMODAL_LOG_POLL_MAX_INTERVAL")
+		}
+		if c.LogSettle < 0 || c.LogMaxCatchUp <= 0 || c.LogInitialLookback < 0 {
+			return fmt.Errorf("config: INTERMODAL_LOG_SETTLE and INTERMODAL_LOG_INITIAL_LOOKBACK must be >= 0 and INTERMODAL_LOG_MAX_CATCHUP > 0")
+		}
 	}
 	return nil
 }

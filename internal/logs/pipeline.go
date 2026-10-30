@@ -1,7 +1,9 @@
-// Package logs streams logs from Railway subscriptions, normalizes them, and
-// fans them out to sinks. It runs one deploy-log subscription per target
-// environment and one HTTP-log subscription per (service, active deployment),
-// each with reconnect + resume; one worker goroutine runs per sink.
+// Package logs reads logs from Railway, normalizes them, and fans them out to
+// sinks. It reads one deploy-log source per target environment and one
+// HTTP-log source per (service, active deployment). By default each source is
+// a cursor-based poller of Railway's log history (see poll.go); the older
+// subscription mode is kept behind INTERMODAL_LOG_SOURCE=subscribe. One worker
+// goroutine runs per sink.
 package logs
 
 import (
@@ -27,6 +29,8 @@ type logSource interface {
 	StreamEnvironmentLogs(ctx context.Context, p railway.LogStreamParams, fn func(railway.LogEntry) error) error
 	StreamHTTPLogs(ctx context.Context, p railway.HTTPLogStreamParams, fn func(railway.HTTPLogEntry) error) error
 	StreamBuildLogs(ctx context.Context, p railway.BuildLogStreamParams, fn func(railway.LogEntry) error) error
+	EnvironmentLogsPage(ctx context.Context, p railway.LogPageParams) ([]railway.LogEntry, error)
+	HTTPLogsPage(ctx context.Context, p railway.LogPageParams) ([]railway.HTTPLogEntry, error)
 }
 
 // svcContext is the per-service enrichment context for an HTTP- or build-log
@@ -61,12 +65,31 @@ type Manager struct {
 	// are finite, so they queue behind this instead.
 	buildSem chan struct{}
 
+	// Poll mode (the default). See poll.go.
+	poll            bool
+	cursors         CursorStore
+	pollMin         time.Duration
+	pollMax         time.Duration
+	settle          time.Duration
+	maxCatchUp      time.Duration
+	initialLookback time.Duration
+	startedAt       time.Time
+	now             func() time.Time
+
 	mu        sync.RWMutex
 	envSubs   map[string]context.CancelFunc // deploy logs, by environment id
 	httpSubs  map[string]context.CancelFunc // http logs, by "serviceID|deploymentID"
-	buildSeen map[string]struct{}           // deployment ids whose build logs were fetched
-	targets   map[string]target.Target      // by environment id, for enrichment
-	subWG     sync.WaitGroup
+	httpPolls map[string]*poller            // poll mode http logs, same key
+	// deployPollers are the poll-mode deploy pollers by environment id; the
+	// environment's HTTP pollers gate on them.
+	deployPollers map[string]*poller
+	// lastReconcile is when discovery last succeeded. A source that appears
+	// later was not active before then, so a poller with no cursor starts
+	// there.
+	lastReconcile time.Time
+	buildSeen     map[string]struct{}      // deployment ids whose build logs were fetched
+	targets       map[string]target.Target // by environment id, for enrichment
+	subWG         sync.WaitGroup
 }
 
 // NewManager wraps each sink in a worker and returns a ready manager.
@@ -89,27 +112,59 @@ func NewManager(src logSource, provider target.Provider, sinks []sink.Sink, cfg 
 	if buildConcurrency < 1 {
 		buildConcurrency = config.DefaultConcurrency
 	}
-	return &Manager{
-		src:           src,
-		provider:      provider,
-		workers:       workers,
-		log:           log,
-		deployEnabled: cfg.DeployLogs,
-		httpEnabled:   cfg.HTTPLogs,
-		buildEnabled:  cfg.BuildLogs,
-		deployFilter:  cfg.LogFilter,
-		httpFilter:    cfg.HTTPLogFilter,
-		backfill:      cfg.LogBackfill,
-		services:      services,
-		httpServices:  httpServices,
-		buildServices: buildServices,
-		reconcileTTL:  ttl,
-		buildSem:      make(chan struct{}, buildConcurrency),
-		envSubs:       map[string]context.CancelFunc{},
-		httpSubs:      map[string]context.CancelFunc{},
-		buildSeen:     map[string]struct{}{},
-		targets:       map[string]target.Target{},
+	pollMin := cfg.LogPollInterval
+	if pollMin <= 0 {
+		pollMin = 10 * time.Second
 	}
+	pollMax := max(cfg.LogPollMaxInterval, pollMin)
+	maxCatchUp := cfg.LogMaxCatchUp
+	if maxCatchUp <= 0 {
+		maxCatchUp = 6 * time.Hour
+	}
+	cursors, _ := newCursorStore("", 0) // in memory; never fails
+	return &Manager{
+		src:             src,
+		provider:        provider,
+		workers:         workers,
+		log:             log,
+		deployEnabled:   cfg.DeployLogs,
+		httpEnabled:     cfg.HTTPLogs,
+		buildEnabled:    cfg.BuildLogs,
+		deployFilter:    cfg.LogFilter,
+		httpFilter:      cfg.HTTPLogFilter,
+		backfill:        cfg.LogBackfill,
+		services:        services,
+		httpServices:    httpServices,
+		buildServices:   buildServices,
+		reconcileTTL:    ttl,
+		buildSem:        make(chan struct{}, buildConcurrency),
+		poll:            cfg.LogSource != config.LogSourceSubscribe,
+		cursors:         cursors,
+		pollMin:         pollMin,
+		pollMax:         pollMax,
+		settle:          max(cfg.LogSettle, 0),
+		maxCatchUp:      maxCatchUp,
+		initialLookback: max(cfg.LogInitialLookback, 0),
+		startedAt:       time.Now(),
+		now:             time.Now,
+		envSubs:         map[string]context.CancelFunc{},
+		httpSubs:        map[string]context.CancelFunc{},
+		httpPolls:       map[string]*poller{},
+		deployPollers:   map[string]*poller{},
+		buildSeen:       map[string]struct{}{},
+		targets:         map[string]target.Target{},
+	}
+}
+
+// SetCursorStore makes pollers keep their cursors in s. Call it before Run;
+// without it cursors live in memory and a restart resumes from
+// INTERMODAL_LOG_INITIAL_LOOKBACK.
+func (m *Manager) SetCursorStore(s CursorStore) { m.cursors = s }
+
+// OpenCursorStore opens the cursor file at path, or returns an in-memory store
+// when path is empty. Cursors older than pruneAfter are dropped on save.
+func OpenCursorStore(path string, pruneAfter time.Duration) (CursorStore, error) {
+	return newCursorStore(path, pruneAfter)
 }
 
 // Run starts sink workers and subscription management, blocking until ctx is
@@ -146,6 +201,8 @@ func (m *Manager) shutdown() {
 		cancel()
 		delete(m.httpSubs, k)
 	}
+	clear(m.httpPolls) // their contexts are in httpSubs
+	clear(m.deployPollers)
 	m.mu.Unlock()
 	m.subWG.Wait()
 	for _, w := range m.workers {
@@ -170,28 +227,55 @@ func (m *Manager) reconcile(ctx context.Context) {
 	defer m.mu.Unlock()
 	m.targets = next
 
+	// Where a new poller with no cursor starts. On the first reconcile that
+	// is shortly before startup, to cover the restart gap; later, a new
+	// source was not there at the previous reconcile.
+	start := m.startedAt.Add(-m.initialLookback)
+	if !m.lastReconcile.IsZero() {
+		start = m.lastReconcile
+	}
+	m.lastReconcile = m.now()
+
 	if m.deployEnabled {
-		m.reconcileDeploy(ctx, next)
+		m.reconcileDeploy(ctx, next, start)
 	}
 	if m.httpEnabled {
-		m.reconcileHTTP(ctx, targets)
+		m.reconcileHTTP(ctx, targets, start)
 	}
 	if m.buildEnabled {
 		m.reconcileBuild(ctx, targets)
 	}
 }
 
-// reconcileDeploy ensures one deploy-log subscription per target environment.
-func (m *Manager) reconcileDeploy(ctx context.Context, next map[string]target.Target) {
+// reconcileDeploy ensures one deploy-log source per target environment.
+// Removed environments stop at once: a redeploy keeps the environment, so
+// its poller already covers both the old and the new deployment.
+func (m *Manager) reconcileDeploy(ctx context.Context, next map[string]target.Target, start time.Time) {
 	for env := range next {
 		if _, ok := m.envSubs[env]; ok {
 			continue
 		}
 		sctx, cancel := context.WithCancel(ctx)
 		m.envSubs[env] = cancel
+		var p *poller
+		if m.poll {
+			p = m.deployPoller(env, next[env], start)
+			// HTTP pollers gate on this from the moment they start, which can
+			// be before this poller loads its cursor, so seed it now.
+			if c, ok := m.cursors.Load(p.key); ok {
+				p.setCursor(c.TS)
+			} else {
+				p.setCursor(start)
+			}
+			m.deployPollers[env] = p
+		}
 		m.subWG.Add(1)
 		go func(env string) {
 			defer m.subWG.Done()
+			if p != nil {
+				m.runPoller(sctx, p)
+				return
+			}
 			m.runEnvSubscription(sctx, env)
 		}(env)
 	}
@@ -199,14 +283,16 @@ func (m *Manager) reconcileDeploy(ctx context.Context, next map[string]target.Ta
 		if _, ok := next[env]; !ok {
 			cancel()
 			delete(m.envSubs, env)
+			delete(m.deployPollers, env)
 		}
 	}
 }
 
-// reconcileHTTP ensures one HTTP-log subscription per (service, active
-// deployment) with a domain. Keying by serviceID|deploymentID means a new
-// deployment automatically supersedes the previous subscription.
-func (m *Manager) reconcileHTTP(ctx context.Context, targets []target.Target) {
+// reconcileHTTP ensures one HTTP-log source per (service, active deployment)
+// with a domain. Keying by serviceID|deploymentID means a new deployment
+// automatically supersedes the previous source. In poll mode the previous
+// deployment's poller first drains the lines it served before the handover.
+func (m *Manager) reconcileHTTP(ctx context.Context, targets []target.Target, start time.Time) {
 	wanted := map[string]svcContext{}
 	for _, t := range targets {
 		for _, s := range t.Services {
@@ -230,6 +316,23 @@ func (m *Manager) reconcileHTTP(ctx context.Context, targets []target.Target) {
 		}
 		sctx, cancel := context.WithCancel(ctx)
 		m.httpSubs[key] = cancel
+		if m.poll {
+			p := m.httpPoller(ht, start)
+			m.httpPolls[key] = p
+			m.subWG.Add(1)
+			go func(key string) {
+				defer m.subWG.Done()
+				m.runPoller(sctx, p)
+				m.mu.Lock()
+				defer m.mu.Unlock()
+				if m.httpPolls[key] == p {
+					delete(m.httpPolls, key)
+					delete(m.httpSubs, key)
+				}
+				cancel()
+			}(key)
+			continue
+		}
 		m.subWG.Add(1)
 		go func(ht svcContext) {
 			defer m.subWG.Done()
@@ -237,10 +340,19 @@ func (m *Manager) reconcileHTTP(ctx context.Context, targets []target.Target) {
 		}(ht)
 	}
 	for key, cancel := range m.httpSubs {
-		if _, ok := wanted[key]; !ok {
-			cancel()
-			delete(m.httpSubs, key)
+		if _, ok := wanted[key]; ok {
+			continue
 		}
+		if p, ok := m.httpPolls[key]; ok {
+			// The poller removes itself once drained.
+			if p.retireAt.IsZero() {
+				p.retireAt = m.now()
+				close(p.retire)
+			}
+			continue
+		}
+		cancel()
+		delete(m.httpSubs, key)
 	}
 }
 

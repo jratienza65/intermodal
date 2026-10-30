@@ -6,6 +6,7 @@ package telemetry
 
 import (
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -50,7 +51,7 @@ var (
 
 	LogsReceived = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "intermodal_logs_received_total",
-		Help: "Total log records received from Railway subscriptions.",
+		Help: "Total log records received from Railway.",
 	})
 
 	LogsForwarded = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -77,7 +78,41 @@ var (
 		Name: "intermodal_log_subscription_reconnects_total",
 		Help: "Total Railway log subscription reconnect attempts.",
 	})
+
+	// LogCursorLag reports intermodal_log_cursor_lag_seconds, computed at
+	// collection time from each poller's live cursor.
+	LogCursorLag = newLagCollector()
+
+	LogCatchUpSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "intermodal_log_catchup_skipped_seconds_total",
+		Help: "Seconds of log history skipped because a cursor was older than INTERMODAL_LOG_MAX_CATCHUP, labeled by kind. The gap needs a backfill.",
+	}, []string{"kind"})
+
+	LogTimestampSkips = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "intermodal_log_timestamp_skips_total",
+		Help: "Times a poller stepped past a timestamp holding more than a page of lines (lines beyond the page at that instant are lost), labeled by kind.",
+	}, []string{"kind"})
+
+	LogPollErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "intermodal_log_poll_errors_total",
+		Help: "Total failed log poll rounds (Railway query or sink delivery), labeled by kind.",
+	}, []string{"kind"})
 )
+
+// rateLimitRemaining and rateLimitLimit mirror Railway's rate-limit headers
+// for readers inside the process; -1 until Railway has reported a value.
+var rateLimitRemaining, rateLimitLimit atomic.Int64
+
+func init() {
+	rateLimitRemaining.Store(-1)
+	rateLimitLimit.Store(-1)
+}
+
+// RateLimitBudget returns the most recent X-RateLimit-Remaining and
+// X-RateLimit-Limit values; either is -1 if Railway has not reported it.
+func RateLimitBudget() (remaining, limit int64) {
+	return rateLimitRemaining.Load(), rateLimitLimit.Load()
+}
 
 // Collectors returns every intermodal self-metric collector.
 func Collectors() []prometheus.Collector {
@@ -86,6 +121,7 @@ func Collectors() []prometheus.Collector {
 		PollSuccess, PollDuration, PollErrors, TargetsDiscovered,
 		LogsReceived, LogsForwarded, LogSinkErrors, LogsDropped,
 		SubscriptionsActive, SubscriptionReconnects,
+		LogCursorLag, LogPollErrors, LogCatchUpSkipped, LogTimestampSkips,
 	}
 }
 
@@ -114,7 +150,12 @@ func ObserveAPIRequest(op string, status int, err error) {
 	APIRequests.WithLabelValues(op, code).Inc()
 }
 
-// ObserveRateLimit matches railway.Hooks.OnRateLimit.
-func ObserveRateLimit(remaining int, _ time.Time) {
+// ObserveRateLimit matches railway.Hooks.OnRateLimit. limit is -1 when
+// Railway sent no X-RateLimit-Limit.
+func ObserveRateLimit(remaining, limit int, _ time.Time) {
 	RateLimitRemaining.Set(float64(remaining))
+	rateLimitRemaining.Store(int64(remaining))
+	if limit > 0 {
+		rateLimitLimit.Store(int64(limit))
+	}
 }

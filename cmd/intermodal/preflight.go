@@ -80,7 +80,21 @@ func doctor(ctx context.Context, cfg *config.Config, client *railway.Client, log
 		fmt.Printf("metrics probe:   OK (%d series for env %s)\n", len(results), first.EnvironmentID)
 	}
 
-	// 4. Trial log subscription.
+	// 4. Trial log query (what the default poll mode reads).
+	if cfg.LogSource == config.LogSourcePoll {
+		lines, err := client.EnvironmentLogsPage(ctx, railway.LogPageParams{
+			ID:         first.EnvironmentID,
+			Anchor:     time.Now().Add(-time.Hour),
+			AfterLimit: 100,
+		})
+		if err != nil {
+			fmt.Printf("log poll probe:  FAILED (%v)\n", err)
+		} else {
+			fmt.Printf("log poll probe:  OK (%d line(s) in the last hour, first 100 max)\n", len(lines))
+		}
+	}
+
+	// 5. Trial log subscription.
 	n, err := trialSubscribe(ctx, client, first.EnvironmentID)
 	switch {
 	case err != nil:

@@ -58,6 +58,15 @@ func (f *fakeSource) StreamHTTPLogs(ctx context.Context, _ railway.HTTPLogStream
 	return ctx.Err()
 }
 
+// The subscription tests run in subscribe mode; the page queries are unused.
+func (f *fakeSource) EnvironmentLogsPage(context.Context, railway.LogPageParams) ([]railway.LogEntry, error) {
+	return nil, nil
+}
+
+func (f *fakeSource) HTTPLogsPage(context.Context, railway.LogPageParams) ([]railway.HTTPLogEntry, error) {
+	return nil, nil
+}
+
 // StreamBuildLogs delivers build entries then returns (build logs are finite).
 func (f *fakeSource) StreamBuildLogs(_ context.Context, _ railway.BuildLogStreamParams, fn func(railway.LogEntry) error) error {
 	for _, e := range f.buildEntries {
@@ -152,6 +161,7 @@ func baseConfig() *config.Config {
 		LogBatchTimeout: 50 * time.Millisecond,
 		DiscoveryTTL:    time.Hour, // avoid periodic reconcile during the test
 		DeployLogs:      true,
+		LogSource:       config.LogSourceSubscribe,
 	}
 }
 
@@ -523,6 +533,14 @@ func (b *blockingBuildSource) StreamEnvironmentLogs(ctx context.Context, _ railw
 func (b *blockingBuildSource) StreamHTTPLogs(ctx context.Context, _ railway.HTTPLogStreamParams, _ func(railway.HTTPLogEntry) error) error {
 	<-ctx.Done()
 	return ctx.Err()
+}
+
+func (b *blockingBuildSource) EnvironmentLogsPage(context.Context, railway.LogPageParams) ([]railway.LogEntry, error) {
+	return nil, nil
+}
+
+func (b *blockingBuildSource) HTTPLogsPage(context.Context, railway.LogPageParams) ([]railway.HTTPLogEntry, error) {
+	return nil, nil
 }
 
 func (b *blockingBuildSource) StreamBuildLogs(_ context.Context, _ railway.BuildLogStreamParams, _ func(railway.LogEntry) error) error {

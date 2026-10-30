@@ -35,8 +35,10 @@ const maxRespBytes = 8 << 20 // 8 MiB cap on a single GraphQL response body
 // Hooks let the caller observe API traffic (wired to telemetry in main) without
 // coupling this package to Prometheus.
 type Hooks struct {
-	OnRequest   func(op string, status int, err error)
-	OnRateLimit func(remaining int, reset time.Time)
+	OnRequest func(op string, status int, err error)
+	// OnRateLimit reports X-RateLimit-Remaining, X-RateLimit-Limit (-1 when
+	// absent) and X-RateLimit-Reset.
+	OnRateLimit func(remaining, limit int, reset time.Time)
 }
 
 func (h Hooks) onRequest(op string, status int, err error) {
@@ -45,9 +47,9 @@ func (h Hooks) onRequest(op string, status int, err error) {
 	}
 }
 
-func (h Hooks) onRateLimit(remaining int, reset time.Time) {
+func (h Hooks) onRateLimit(remaining, limit int, reset time.Time) {
 	if h.OnRateLimit != nil {
-		h.OnRateLimit(remaining, reset)
+		h.OnRateLimit(remaining, limit, reset)
 	}
 }
 
@@ -285,6 +287,12 @@ func (c *Client) observeRateLimit(h http.Header) {
 			remaining = n
 		}
 	}
+	limit := -1
+	if v := h.Get("X-RateLimit-Limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
 	var reset time.Time
 	if v := h.Get("X-RateLimit-Reset"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
@@ -298,7 +306,7 @@ func (c *Client) observeRateLimit(h http.Header) {
 		}
 	}
 	if remaining >= 0 {
-		c.hooks.onRateLimit(remaining, reset)
+		c.hooks.onRateLimit(remaining, limit, reset)
 	}
 }
 

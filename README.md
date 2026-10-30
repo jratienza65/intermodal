@@ -96,7 +96,7 @@ intermodal fans out over the targets that discovery returns. `INTERMODAL_CONCURR
 
 Values below `1` are raised to `1` (a fan-out of zero would stall), and values above `256` are lowered to `256`. Rate is a separate control: `INTERMODAL_RAILWAY_RPS` and `INTERMODAL_RAILWAY_BURST` throttle the request rate, while concurrency bounds the requests in flight. Raise concurrency for a large fleet that polls slowly; lower it to soften the burst against Railway.
 
-Deploy-log and HTTP-log subscriptions are **not** bounded this way. They are long-lived streams that hold their goroutine until the target goes away, so a limit would starve every target that did not get a slot. One subscription per environment (deploy) or per service deployment (HTTP) is the design; scope them with `INTERMODAL_SERVICES` / `INTERMODAL_HTTP_LOG_SERVICES` instead.
+Deploy-log and HTTP-log sources are **not** bounded this way. Each one is a long-lived poller (or subscription) that holds its goroutine until the target goes away, so a limit would starve every target that did not get a slot. One source per environment (deploy) or per service deployment (HTTP) is the design; scope them with `INTERMODAL_SERVICES` / `INTERMODAL_HTTP_LOG_SERVICES` instead. Their request rate is bounded by the poll interval and by `INTERMODAL_RAILWAY_RPS`.
 
 ### Discovery / target selection
 
@@ -131,9 +131,16 @@ Deploy-log and HTTP-log subscriptions are **not** bounded this way. They are lon
 |---|---|---|
 | `INTERMODAL_LOGS_ENABLED` | `true` | Enable the log drain. |
 | `INTERMODAL_SINKS` | `stdout` | Comma-separated sinks: `stdout`, `loki`, `otlp` (e.g. `loki,otlp`). |
-| `INTERMODAL_LOG_FILTER` | — | Railway filter DSL applied to every subscription (e.g. `@level:error`). |
-| `INTERMODAL_LOG_BACKFILL` | `0` | Number of prior lines to fetch on connect (`beforeLimit`). |
-| `INTERMODAL_LOG_QUEUE_SIZE` | `10000` | Per-sink buffered queue depth (overflow → dropped, counted). |
+| `INTERMODAL_LOG_SOURCE` | `poll` | How deploy and HTTP logs are read: `poll` pages Railway's log history from a cursor; `subscribe` uses the live GraphQL subscriptions. See [Log source](#log-source-poll-vs-subscribe). |
+| `INTERMODAL_LOG_CURSOR_FILE` | — | Poll mode. File that keeps the cursors across restarts, e.g. `/data/intermodal-cursors.json` on a Railway volume. Unset keeps them in memory. |
+| `INTERMODAL_LOG_POLL_INTERVAL` | `10s` | Poll mode. Poll period while a source returns lines. |
+| `INTERMODAL_LOG_POLL_MAX_INTERVAL` | `60s` | Poll mode. Idle sources back off up to this. Below 20% of Railway's hourly request budget (`X-RateLimit-Remaining` / `X-RateLimit-Limit`), every wait stretches in proportion to how little is left, up to 20×. |
+| `INTERMODAL_LOG_SETTLE` | `20s` | Poll mode. Lines newer than `now − settle` wait for the next poll, so late lines reach Railway first. |
+| `INTERMODAL_LOG_MAX_CATCHUP` | `6h` | Poll mode. Furthest back a stored cursor is resumed from. Older gaps are skipped with a warning. |
+| `INTERMODAL_LOG_INITIAL_LOOKBACK` | `5m` | Poll mode. Where a source with no stored cursor starts, back from process start. |
+| `INTERMODAL_LOG_FILTER` | — | Railway filter DSL applied to every deploy-log query or subscription (e.g. `@level:error`). |
+| `INTERMODAL_LOG_BACKFILL` | `0` | Subscribe mode. Number of prior lines to fetch on connect (`beforeLimit`). |
+| `INTERMODAL_LOG_QUEUE_SIZE` | `10000` | Per-sink buffered queue depth. Subscribe mode drops on overflow (counted); poll mode waits. |
 | `INTERMODAL_LOG_BATCH_SIZE` | `500` | Max records per sink flush. |
 | `INTERMODAL_LOG_BATCH_TIMEOUT` | `2s` | Max time to wait before flushing a partial batch. |
 
@@ -199,12 +206,16 @@ All of the above carry the labels: `project_id`, `project_name`, `environment_id
 | `intermodal_metrics_poll_duration_seconds` | histogram | Duration of a full metrics poll cycle. |
 | `intermodal_metrics_poll_errors_total` | counter | Per-target errors encountered while polling. |
 | `intermodal_targets_discovered` | gauge | Number of environments currently discovered as targets. |
-| `intermodal_logs_received_total` | counter | Log records received from Railway subscriptions. |
+| `intermodal_logs_received_total` | counter | Log records received from Railway. |
 | `intermodal_logs_forwarded_total{sink}` | counter | Records successfully forwarded, by sink. |
 | `intermodal_log_sink_errors_total{sink}` | counter | Sink write errors, by sink. |
 | `intermodal_logs_dropped_total{sink}` | counter | Records dropped due to a full sink queue, by sink. |
 | `intermodal_log_subscriptions_active` | gauge | Currently-open Railway log subscriptions. |
 | `intermodal_log_subscription_reconnects_total` | counter | Log subscription reconnect attempts. |
+| `intermodal_log_cursor_lag_seconds{kind,project,environment,service}` | gauge | Poll mode. Seconds since the point up to which every line of a source was delivered. Computed at scrape time from the live cursor, so it keeps growing during a long catch-up or a stalled sink, and it exists from poller start. Normally about `settle` plus the poll interval; alert when it grows past a few minutes, and on its absence. `service` is empty for `deploy`, which is polled per environment. |
+| `intermodal_log_poll_errors_total{kind}` | counter | Poll mode. Failed poll rounds (Railway query error, or a sink dropped part of a page). One sink failure can fail every poller that was waiting on that sink at the time; they resend, so this overcounts. |
+| `intermodal_log_catchup_skipped_seconds_total{kind}` | counter | Poll mode. Seconds of history skipped because a cursor was older than `INTERMODAL_LOG_MAX_CATCHUP`. Any increase is a gap to backfill. |
+| `intermodal_log_timestamp_skips_total{kind}` | counter | Poll mode. Times a poller stepped past a timestamp holding more than a page of lines; lines past the page at that instant are lost. |
 
 Standard Go runtime and process collectors are also registered.
 
@@ -226,7 +237,7 @@ Two cases need `INTERMODAL_INSTANCE_ID`:
 
 ## Logs: record shape and sinks
 
-Railway log lines are streamed from the GraphQL-WS `environmentLogs` subscription, normalized into a common record, and fanned out to every configured sink through per-sink batched queues. Railway's free-form `severity` is folded into a canonical `level` (`debug`/`info`/`warn`/`error`), with the raw value preserved as `severity`.
+Railway log lines are read from Railway (see [Log source](#log-source-poll-vs-subscribe)), normalized into a common record, and fanned out to every configured sink through per-sink batched queues. Railway's free-form `severity` is folded into a canonical `level` (`debug`/`info`/`warn`/`error`), with the raw value preserved as `severity`.
 
 The `stdout` sink writes each record as one JSON object per line (JSONL). intermodal's own diagnostics go to **stderr** (slog JSON), so stdout JSONL stays clean for a tailing collector.
 
@@ -252,6 +263,22 @@ The `stdout` sink writes each record as one JSON object per line (JSONL). interm
 
 Empty fields are omitted. `kind` is one of `deploy`, `http`, or `build`. Structured key/values from the log line are nested under `attributes`.
 
+### Log source: poll vs subscribe
+
+Railway's `environmentLogs` and `httpLogs` GraphQL subscriptions deliver only part of the lines Railway stores. In one measured 30-minute window a subscription delivered about 1% of a service's deploy lines and about 27% of its HTTP lines, while intermodal dropped none of what it received. They also cannot catch up after an outage. So by default (`INTERMODAL_LOG_SOURCE=poll`) intermodal reads the history queries instead:
+
+- **Deploy logs:** one poller per environment, paging `environmentLogs(anchorDate, beforeLimit: 0, afterLimit: 1000)`. One query covers every service in the environment.
+- **HTTP logs:** one poller per active domained deployment, paging `httpLogs` the same way. When a redeploy replaces a deployment, the old poller keeps going until it has read up to the handover, then stops.
+- Each poll reads from the source's cursor up to `now − INTERMODAL_LOG_SETTLE` and keeps paging while pages come back full. A page starts at the previous page's last timestamp, and lines already delivered at that timestamp are skipped by content hash.
+- The cursor moves only after every sink has accepted the page. If a sink drops a batch, the next poll sends the page again: healthy sinks see duplicates, which Loki collapses. A full sink queue makes the poller wait, so poll mode never drops on overflow. "Accepted" is the sink's own reply. For `otlp` that is the first collector, and a later hop (another collector, or Loki) can still drop the lines.
+- With `INTERMODAL_LOG_CURSOR_FILE` on a volume, a restart resumes from the cursors and catches up oldest-first, up to `INTERMODAL_LOG_MAX_CATCHUP`. Loki rejects lines more than 1h (by default) behind a stream's newest entry. Behind an OTLP collector, `railway.log_kind` is usually only an attribute, so a service's deploy and HTTP lines share one stream. HTTP pollers catch up much faster than an environment's deploy poller, so they are held to at most 45 minutes ahead of it. Without that gate, the deploy lines behind them would be rejected. The other way round, an HTTP poller more than 50 minutes behind its deploy poller (say, after `httpLogs` kept failing) skips ahead to that point. Loki would reject the older lines anyway, so the skip is logged with its window and counted in `intermodal_log_catchup_skipped_seconds_total`, ready for a backfill. Deploy logs never wait for HTTP logs, so one failing HTTP source cannot hold up an environment's deploy logs.
+
+On Railway, attach a volume to the intermodal service (say at `/data`) and set `INTERMODAL_LOG_CURSOR_FILE=/data/intermodal-cursors.json`. A volume belongs to one service, so give each intermodal service its own. Without it, every redeploy loses whatever is older than `INTERMODAL_LOG_INITIAL_LOOKBACK`.
+
+Expect far more lines than subscribe mode delivered. A busy environment can produce over 100 lines a second, which is about 400 page queries an hour for its deploy poller alone, plus up to 360 an hour for each HTTP poller. Railway's budget is per token (10,000 requests an hour when measured), and every intermodal instance and tool on that token shares it. Filter noisy services with `INTERMODAL_LOG_FILTER` or `INTERMODAL_SERVICES` if the volume is more than you want.
+
+The record shape is the same in both modes. `INTERMODAL_LOG_SOURCE=subscribe` restores the old behavior.
+
 **Available sinks:**
 
 - `stdout` — JSONL to stdout. Great for local debugging or hand-off to a stdout-tailing collector (e.g. Vector).
@@ -266,6 +293,7 @@ Empty fields are omitted. `kind` is one of `deploy`, `http`, or `build`. Structu
 - **identity** (account token: `Me` name/email) or **project scope** (project token: bound project + environment),
 - **discovery**: the target environments found (with service counts),
 - a **trial metrics call** against the first target,
+- in poll mode, a **trial log query** that reads up to 100 deploy lines from the last hour of the first target.
 - a **trial log subscription** that connects briefly and reports how many lines it saw.
 
 ```bash

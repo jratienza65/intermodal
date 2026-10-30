@@ -139,6 +139,18 @@ func serve(cfg *config.Config, client *railway.Client, logger *slog.Logger) erro
 			return err
 		}
 		mgr := logs.NewManager(client, provider, sinks, cfg, logger)
+		if cfg.LogSource == config.LogSourcePoll {
+			if cfg.LogCursorFile == "" {
+				logger.Warn("INTERMODAL_LOG_CURSOR_FILE is unset; log cursors are kept in memory, so a restart cannot catch up past INTERMODAL_LOG_INITIAL_LOOKBACK")
+			}
+			// Twice the catch-up limit, so a briefly vanished source still
+			// resumes from its cursor.
+			cursors, err := logs.OpenCursorStore(cfg.LogCursorFile, 2*cfg.LogMaxCatchUp)
+			if err != nil {
+				return err
+			}
+			mgr.SetCursorStore(cursors)
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -165,6 +177,7 @@ func serve(cfg *config.Config, client *railway.Client, logger *slog.Logger) erro
 		"poll_concurrency", cfg.PollConcurrency,
 		"logs_enabled", cfg.LogsEnabled,
 		"log_sinks", cfg.LogSinks,
+		"log_source", cfg.LogSource,
 		"addr", cfg.HTTPAddr,
 	)
 

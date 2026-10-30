@@ -175,3 +175,94 @@ func (c *Client) StreamBuildLogs(ctx context.Context, p BuildLogStreamParams, fn
 		return nil
 	})
 }
+
+// LogPageParams selects one page of logs that start at an anchor. Railway's
+// log history queries take anchorDate + afterLimit: they return up to
+// AfterLimit lines at or after Anchor, oldest first. Other combinations do not
+// page reliably: afterDate without an anchor ignores the date and returns the
+// newest lines, and beforeDate returns lines newer than the date.
+type LogPageParams struct {
+	// ID is the environment ID for EnvironmentLogsPage and the deployment ID
+	// for HTTPLogsPage.
+	ID         string
+	Filter     string
+	Anchor     time.Time
+	AfterLimit int
+}
+
+func (p LogPageParams) vars(idKey string) map[string]any {
+	vars := map[string]any{
+		idKey:         p.ID,
+		"anchorDate":  p.Anchor.UTC().Format(time.RFC3339Nano),
+		"beforeLimit": 0,
+		"afterLimit":  p.AfterLimit,
+	}
+	if p.Filter != "" {
+		vars["filter"] = p.Filter
+	}
+	return vars
+}
+
+const environmentLogsQuery = `query intermodalEnvironmentLogsPage($environmentId: String!, $filter: String, $beforeLimit: Int!, $anchorDate: String, $afterLimit: Int) {
+  environmentLogs(environmentId: $environmentId, filter: $filter, anchorDate: $anchorDate, beforeLimit: $beforeLimit, afterLimit: $afterLimit) {
+    timestamp
+    message
+    severity
+    tags { projectId environmentId pluginId serviceId deploymentId deploymentInstanceId snapshotId }
+    attributes { key value }
+  }
+}`
+
+// EnvironmentLogsPage fetches one page of an environment's deploy logs
+// starting at p.Anchor. Unlike the environmentLogs subscription, the history
+// query returns every line Railway holds for the window.
+func (c *Client) EnvironmentLogsPage(ctx context.Context, p LogPageParams) ([]LogEntry, error) {
+	var res struct {
+		EnvironmentLogs []LogEntry `json:"environmentLogs"`
+	}
+	err := c.Execute(ctx, Request{
+		OpName:    "intermodalEnvironmentLogsPage",
+		Query:     environmentLogsQuery,
+		Variables: p.vars("environmentId"),
+	}, &res)
+	return res.EnvironmentLogs, err
+}
+
+const httpLogsQuery = `query intermodalHttpLogsPage($deploymentId: String!, $filter: String, $beforeLimit: Int!, $anchorDate: String, $afterLimit: Int) {
+  httpLogs(deploymentId: $deploymentId, filter: $filter, anchorDate: $anchorDate, beforeLimit: $beforeLimit, afterLimit: $afterLimit) {
+    timestamp
+    requestId
+    method
+    path
+    host
+    httpStatus
+    upstreamProto
+    downstreamProto
+    responseDetails
+    totalDuration
+    upstreamAddress
+    upstreamErrors
+    clientUa
+    upstreamRqDuration
+    txBytes
+    rxBytes
+    srcIp
+    edgeRegion
+    deploymentId
+    deploymentInstanceId
+  }
+}`
+
+// HTTPLogsPage fetches one page of a deployment's HTTP/edge logs starting at
+// p.Anchor.
+func (c *Client) HTTPLogsPage(ctx context.Context, p LogPageParams) ([]HTTPLogEntry, error) {
+	var res struct {
+		HTTPLogs []HTTPLogEntry `json:"httpLogs"`
+	}
+	err := c.Execute(ctx, Request{
+		OpName:    "intermodalHttpLogsPage",
+		Query:     httpLogsQuery,
+		Variables: p.vars("deploymentId"),
+	}, &res)
+	return res.HTTPLogs, err
+}

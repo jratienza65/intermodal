@@ -369,3 +369,23 @@ func TestConcurrencyClamp(t *testing.T) {
 		}
 	}
 }
+
+func TestLogSource(t *testing.T) {
+	c, err := Load(envMap(map[string]string{"RAILWAY_API_TOKEN": "a"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.LogSource != LogSourcePoll || c.LogSettle != 20*time.Second || c.LogMaxCatchUp != 6*time.Hour {
+		t.Fatalf("defaults: source=%q settle=%v catchup=%v", c.LogSource, c.LogSettle, c.LogMaxCatchUp)
+	}
+	c, err = Load(envMap(map[string]string{"RAILWAY_API_TOKEN": "a", "INTERMODAL_LOG_SOURCE": "Subscribe"}))
+	if err != nil || c.LogSource != LogSourceSubscribe {
+		t.Fatalf("subscribe: %v %v", c, err)
+	}
+	if _, err := Load(envMap(map[string]string{"RAILWAY_API_TOKEN": "a", "INTERMODAL_LOG_SOURCE": "push"})); err == nil {
+		t.Fatal("unknown source accepted")
+	}
+	if _, err := Load(envMap(map[string]string{"RAILWAY_API_TOKEN": "a", "INTERMODAL_LOG_POLL_INTERVAL": "2m"})); err == nil {
+		t.Fatal("poll interval above max interval accepted")
+	}
+}
