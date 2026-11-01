@@ -66,7 +66,10 @@ type Manager struct {
 	buildSem chan struct{}
 
 	// Poll mode (the default). See poll.go.
-	poll            bool
+	poll bool
+	// perService runs one deploy poller per service instead of one per
+	// environment (INTERMODAL_LOG_DEPLOY_SCOPE=service).
+	perService      bool
 	cursors         CursorStore
 	pollMin         time.Duration
 	pollMax         time.Duration
@@ -77,11 +80,11 @@ type Manager struct {
 	now             func() time.Time
 
 	mu        sync.RWMutex
-	envSubs   map[string]context.CancelFunc // deploy logs, by environment id
+	envSubs   map[string]context.CancelFunc // deploy logs, by deploySourceKey
 	httpSubs  map[string]context.CancelFunc // http logs, by "serviceID|deploymentID"
 	httpPolls map[string]*poller            // poll mode http logs, same key
-	// deployPollers are the poll-mode deploy pollers by environment id; the
-	// environment's HTTP pollers gate on them.
+	// deployPollers are the poll-mode deploy pollers by deploySourceKey; the
+	// HTTP pollers of the same environment (or service) gate on them.
 	deployPollers map[string]*poller
 	// lastReconcile is when discovery last succeeded. A source that appears
 	// later was not active before then, so a poller with no cursor starts
@@ -139,6 +142,7 @@ func NewManager(src logSource, provider target.Provider, sinks []sink.Sink, cfg 
 		reconcileTTL:    ttl,
 		buildSem:        make(chan struct{}, buildConcurrency),
 		poll:            cfg.LogSource != config.LogSourceSubscribe,
+		perService:      cfg.LogSource != config.LogSourceSubscribe && cfg.LogDeployScope == config.LogDeployScopeService,
 		cursors:         cursors,
 		pollMin:         pollMin,
 		pollMax:         pollMax,
@@ -247,19 +251,51 @@ func (m *Manager) reconcile(ctx context.Context) {
 	}
 }
 
-// reconcileDeploy ensures one deploy-log source per target environment.
-// Removed environments stop at once: a redeploy keeps the environment, so
-// its poller already covers both the old and the new deployment.
+// deploySource is one deploy-log source: an environment, or in per-service
+// scope one service of it.
+type deploySource struct {
+	envID string
+	tg    target.Target
+	svc   *target.Service // nil in environment scope
+}
+
+// deploySourceKey keys envSubs and deployPollers: the environment id, or
+// "envID|serviceID" in per-service scope.
+func (m *Manager) deploySourceKey(envID, serviceID string) string {
+	if m.perService {
+		return envID + "|" + serviceID
+	}
+	return envID
+}
+
+// reconcileDeploy ensures one deploy-log source per target environment, or
+// in per-service scope one per service with an active deployment. Removed
+// sources stop at once: a redeploy keeps the environment and the service, so
+// the poller already covers both the old and the new deployment.
 func (m *Manager) reconcileDeploy(ctx context.Context, next map[string]target.Target, start time.Time) {
-	for env := range next {
-		if _, ok := m.envSubs[env]; ok {
+	wanted := map[string]deploySource{}
+	for env, tg := range next {
+		if !m.perService {
+			wanted[env] = deploySource{envID: env, tg: tg}
+			continue
+		}
+		for i := range tg.Services {
+			s := &tg.Services[i]
+			if s.DeploymentID == "" || !inScope(m.services, s.ID, s.Name) {
+				continue
+			}
+			wanted[m.deploySourceKey(env, s.ID)] = deploySource{envID: env, tg: tg, svc: s}
+		}
+	}
+	for key, src := range wanted {
+		if _, ok := m.envSubs[key]; ok {
 			continue
 		}
 		sctx, cancel := context.WithCancel(ctx)
-		m.envSubs[env] = cancel
+		m.envSubs[key] = cancel
 		var p *poller
 		if m.poll {
-			p = m.deployPoller(env, next[env], start)
+			p = m.deployPoller(src.envID, src.tg, src.svc, start)
 			// HTTP pollers gate on this from the moment they start, which can
 			// be before this poller loads its cursor, so seed it now.
 			if c, ok := m.cursors.Load(p.key); ok {
@@ -267,7 +303,7 @@ func (m *Manager) reconcileDeploy(ctx context.Context, next map[string]target.Ta
 			} else {
 				p.setCursor(start)
 			}
-			m.deployPollers[env] = p
+			m.deployPollers[key] = p
 		}
 		m.subWG.Add(1)
 		go func(env string) {
@@ -277,13 +313,13 @@ func (m *Manager) reconcileDeploy(ctx context.Context, next map[string]target.Ta
 				return
 			}
 			m.runEnvSubscription(sctx, env)
-		}(env)
+		}(src.envID)
 	}
-	for env, cancel := range m.envSubs {
-		if _, ok := next[env]; !ok {
+	for key, cancel := range m.envSubs {
+		if _, ok := wanted[key]; !ok {
 			cancel()
-			delete(m.envSubs, env)
-			delete(m.deployPollers, env)
+			delete(m.envSubs, key)
+			delete(m.deployPollers, key)
 		}
 	}
 }

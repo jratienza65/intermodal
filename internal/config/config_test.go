@@ -389,3 +389,20 @@ func TestLogSource(t *testing.T) {
 		t.Fatal("poll interval above max interval accepted")
 	}
 }
+
+func TestLogDeployScope(t *testing.T) {
+	c, err := Load(envMap(map[string]string{"RAILWAY_API_TOKEN": "a"}))
+	if err != nil || c.LogDeployScope != LogDeployScopeEnvironment {
+		t.Fatalf("default: %q %v", c.LogDeployScope, err)
+	}
+	c, err = Load(envMap(map[string]string{"RAILWAY_API_TOKEN": "a", "INTERMODAL_LOG_DEPLOY_SCOPE": "Service"}))
+	if err != nil || c.LogDeployScope != LogDeployScopeService {
+		t.Fatalf("service: %q %v", c.LogDeployScope, err)
+	}
+	if _, err := Load(envMap(map[string]string{"RAILWAY_API_TOKEN": "a", "INTERMODAL_LOG_DEPLOY_SCOPE": "project"})); err == nil {
+		t.Fatal("unknown scope accepted")
+	}
+	if _, err := Load(envMap(map[string]string{"RAILWAY_API_TOKEN": "a", "INTERMODAL_LOG_DEPLOY_SCOPE": "service", "INTERMODAL_LOG_SOURCE": "subscribe"})); err == nil {
+		t.Fatal("service scope accepted in subscribe mode")
+	}
+}

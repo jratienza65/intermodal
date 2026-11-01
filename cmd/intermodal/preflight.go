@@ -82,15 +82,22 @@ func doctor(ctx context.Context, cfg *config.Config, client *railway.Client, log
 
 	// 4. Trial log query (what the default poll mode reads).
 	if cfg.LogSource == config.LogSourcePoll {
+		// In per-service scope, probe the query the pollers run: one service.
+		filter, scope := "", "env "+first.EnvironmentID
+		if cfg.LogDeployScope == config.LogDeployScopeService && len(first.Services) > 0 {
+			filter = "@service:" + first.Services[0].ID
+			scope = "service " + first.Services[0].Name
+		}
 		lines, err := client.EnvironmentLogsPage(ctx, railway.LogPageParams{
 			ID:         first.EnvironmentID,
+			Filter:     filter,
 			Anchor:     time.Now().Add(-time.Hour),
 			AfterLimit: 100,
 		})
 		if err != nil {
-			fmt.Printf("log poll probe:  FAILED (%v)\n", err)
+			fmt.Printf("log poll probe:  FAILED for %s (%v)\n", scope, err)
 		} else {
-			fmt.Printf("log poll probe:  OK (%d line(s) in the last hour, first 100 max)\n", len(lines))
+			fmt.Printf("log poll probe:  OK for %s (%d line(s) in the last hour, first 100 max)\n", scope, len(lines))
 		}
 	}
 

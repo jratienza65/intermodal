@@ -88,6 +88,12 @@ type Config struct {
 	// Railway's log history queries from a cursor; "subscribe" uses the live
 	// GraphQL subscriptions, which deliver only part of the lines.
 	LogSource string
+	// LogDeployScope picks what one poll-mode deploy-log query covers:
+	// "environment" (default) reads every service of an environment in one
+	// query; "service" runs one query per service with an active deployment,
+	// filtered by @service:<id>. Use "service" when Railway refuses the
+	// environment query ("This log query scans too much data").
+	LogDeployScope string
 	// LogCursorFile is where poll cursors persist across restarts (e.g. on a
 	// Railway volume). Empty keeps them in memory only.
 	LogCursorFile string
@@ -141,6 +147,12 @@ const DefaultConcurrency = 4
 const (
 	LogSourcePoll      = "poll"
 	LogSourceSubscribe = "subscribe"
+)
+
+// Deploy-log query scopes in poll mode (INTERMODAL_LOG_DEPLOY_SCOPE).
+const (
+	LogDeployScopeEnvironment = "environment"
+	LogDeployScopeService     = "service"
 )
 
 // maxConcurrency is the ceiling on any configured fan-out. The Railway client's
@@ -268,6 +280,7 @@ func Load(getenv Getenv) (*Config, error) {
 		BuildLogs:          e.bool("INTERMODAL_BUILD_LOGS", false),
 		BuildLogServices:   e.list("INTERMODAL_BUILD_LOG_SERVICES"),
 		LogSource:          strings.ToLower(e.str("INTERMODAL_LOG_SOURCE", LogSourcePoll)),
+		LogDeployScope:     strings.ToLower(e.str("INTERMODAL_LOG_DEPLOY_SCOPE", LogDeployScopeEnvironment)),
 		LogCursorFile:      e.str("INTERMODAL_LOG_CURSOR_FILE", ""),
 		LogPollInterval:    e.dur("INTERMODAL_LOG_POLL_INTERVAL", 10*time.Second),
 		LogPollMaxInterval: e.dur("INTERMODAL_LOG_POLL_MAX_INTERVAL", 60*time.Second),
@@ -403,6 +416,12 @@ func (c *Config) validate() error {
 	}
 	if c.LogSource != LogSourcePoll && c.LogSource != LogSourceSubscribe {
 		return fmt.Errorf("config: INTERMODAL_LOG_SOURCE must be %q or %q, got %q", LogSourcePoll, LogSourceSubscribe, c.LogSource)
+	}
+	if c.LogDeployScope != LogDeployScopeEnvironment && c.LogDeployScope != LogDeployScopeService {
+		return fmt.Errorf("config: INTERMODAL_LOG_DEPLOY_SCOPE must be %q or %q, got %q", LogDeployScopeEnvironment, LogDeployScopeService, c.LogDeployScope)
+	}
+	if c.LogDeployScope == LogDeployScopeService && c.LogSource != LogSourcePoll {
+		return fmt.Errorf("config: INTERMODAL_LOG_DEPLOY_SCOPE=%s needs INTERMODAL_LOG_SOURCE=%s", LogDeployScopeService, LogSourcePoll)
 	}
 	if c.LogSource == LogSourcePoll {
 		if c.LogPollInterval <= 0 || c.LogPollMaxInterval < c.LogPollInterval {

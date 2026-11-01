@@ -137,7 +137,7 @@ func newPollHarness(t *testing.T, src logSource, cfg *config.Config, sinks []sin
 }
 
 func (h *pollHarness) deploy(start time.Time) *poller {
-	return h.m.deployPoller(testEnvID, oneTarget(), start)
+	return h.m.deployPoller(testEnvID, oneTarget(), nil, start)
 }
 
 // messages counts each delivered message.

@@ -9,6 +9,7 @@ import (
 	"maps"
 	"sort"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -96,15 +97,22 @@ func (p *poller) setCursor(ts time.Time) {
 
 func (p *poller) position() time.Time { return time.Unix(0, p.pos.Load()) }
 
-// deployPoller polls one environment's deploy logs. One query covers every
-// service in the environment.
-func (m *Manager) deployPoller(env string, tg target.Target, start time.Time) *poller {
+// deployPoller polls deploy logs: one environment's (svc nil, one query
+// covers every service), or one service's, through a @service:<id> filter
+// on the same environment query.
+func (m *Manager) deployPoller(env string, tg target.Target, svc *target.Service, start time.Time) *poller {
+	key, filter, service := "deploy|"+env, m.deployFilter, ""
+	if svc != nil {
+		key += "|" + svc.ID
+		filter = serviceFilter(svc.ID, m.deployFilter)
+		service = svc.Name
+	}
 	return &poller{
-		key: "deploy|" + env, kind: model.KindDeploy, start: start,
-		project: tg.ProjectName, environment: tg.EnvironmentName,
+		key: key, kind: model.KindDeploy, start: start,
+		project: tg.ProjectName, environment: tg.EnvironmentName, service: service,
 		fetch: func(ctx context.Context, anchor time.Time) ([]pollEntry, error) {
 			page, err := m.src.EnvironmentLogsPage(ctx, railway.LogPageParams{
-				ID: env, Filter: m.deployFilter, Anchor: anchor, AfterLimit: pollPageSize,
+				ID: env, Filter: filter, Anchor: anchor, AfterLimit: pollPageSize,
 			})
 			if err != nil {
 				return nil, err
@@ -130,14 +138,14 @@ func (m *Manager) httpPoller(ht svcContext, start time.Time) *poller {
 		key: "http|" + ht.deploymentID, kind: model.KindHTTP, start: start,
 		project: ht.projectName, environment: ht.envName, service: ht.serviceName,
 		gate: func() (time.Time, bool) {
-			d, ok := m.deployPollerOf(ht.envID)
+			d, ok := m.deployPollerOf(m.deploySourceKey(ht.envID, ht.serviceID))
 			if !ok {
 				return time.Time{}, false
 			}
 			return d.position().Add(maxKindSkew), true
 		},
 		floor: func() (time.Time, bool) {
-			d, ok := m.deployPollerOf(ht.envID)
+			d, ok := m.deployPollerOf(m.deploySourceKey(ht.envID, ht.serviceID))
 			if !ok {
 				return time.Time{}, false
 			}
@@ -165,10 +173,26 @@ func (m *Manager) httpPoller(ht svcContext, start time.Time) *poller {
 	}
 }
 
-func (m *Manager) deployPollerOf(env string) (*poller, bool) {
+// serviceFilter narrows a deploy-log query to one service, keeping the user's
+// INTERMODAL_LOG_FILTER. A filter with OR is grouped so the service term
+// applies to every alternative, not only the first.
+func serviceFilter(serviceID, userFilter string) string {
+	f := "@service:" + serviceID
+	userFilter = strings.TrimSpace(userFilter)
+	switch {
+	case userFilter == "":
+		return f
+	case strings.Contains(" "+strings.ToUpper(userFilter)+" ", " OR "):
+		return f + " (" + userFilter + ")"
+	default:
+		return f + " " + userFilter
+	}
+}
+
+func (m *Manager) deployPollerOf(key string) (*poller, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	d, ok := m.deployPollers[env]
+	d, ok := m.deployPollers[key]
 	return d, ok
 }
 
