@@ -23,10 +23,13 @@ var (
 		Help: "Total Railway GraphQL requests, labeled by operation and outcome (HTTP status or \"error\").",
 	}, []string{"op", "code"})
 
-	RateLimitRemaining = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "railway_api_rate_limit_remaining",
-		Help: "Most recent X-RateLimit-Remaining value reported by Railway.",
-	})
+	// RateLimitRemaining has no sample until Railway sends an
+	// X-RateLimit-Remaining header. Some tokens never get one, and a gauge
+	// stuck at 0 would read as an exhausted budget.
+	RateLimitRemaining prometheus.Collector = rateLimitCollector{
+		desc: prometheus.NewDesc("railway_api_rate_limit_remaining",
+			"Most recent X-RateLimit-Remaining value reported by Railway. Absent until Railway has sent one.", nil, nil),
+	}
 
 	PollSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "intermodal_metrics_poll_success",
@@ -114,6 +117,16 @@ func RateLimitBudget() (remaining, limit int64) {
 	return rateLimitRemaining.Load(), rateLimitLimit.Load()
 }
 
+type rateLimitCollector struct{ desc *prometheus.Desc }
+
+func (c rateLimitCollector) Describe(ch chan<- *prometheus.Desc) { ch <- c.desc }
+
+func (c rateLimitCollector) Collect(ch chan<- prometheus.Metric) {
+	if v := rateLimitRemaining.Load(); v >= 0 {
+		ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, float64(v))
+	}
+}
+
 // Collectors returns every intermodal self-metric collector.
 func Collectors() []prometheus.Collector {
 	return []prometheus.Collector{
@@ -153,7 +166,6 @@ func ObserveAPIRequest(op string, status int, err error) {
 // ObserveRateLimit matches railway.Hooks.OnRateLimit. limit is -1 when
 // Railway sent no X-RateLimit-Limit.
 func ObserveRateLimit(remaining, limit int, _ time.Time) {
-	RateLimitRemaining.Set(float64(remaining))
 	rateLimitRemaining.Store(int64(remaining))
 	if limit > 0 {
 		rateLimitLimit.Store(int64(limit))

@@ -202,7 +202,7 @@ All of the above carry the labels: `project_id`, `project_name`, `environment_id
 |---|---|---|
 | `intermodal_build_info{version}` | gauge | Constant `1`, labeled by build version. |
 | `railway_api_requests_total{op,code}` | counter | Railway GraphQL requests by operation and outcome (HTTP status or `error`). |
-| `railway_api_rate_limit_remaining` | gauge | Most recent `X-RateLimit-Remaining` from Railway. |
+| `railway_api_rate_limit_remaining` | gauge | Most recent `X-RateLimit-Remaining` from Railway. Absent until Railway sends the header; some tokens (e.g. project tokens) never get one. |
 | `intermodal_metrics_poll_success` | gauge | `1` if the last poll cycle fully succeeded, else `0`. |
 | `intermodal_metrics_poll_duration_seconds` | histogram | Duration of a full metrics poll cycle. |
 | `intermodal_metrics_poll_errors_total` | counter | Per-target errors encountered while polling. |
